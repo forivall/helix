@@ -2636,6 +2636,13 @@ impl Editor {
         doc.set_selection(view_id, selection);
         view.ensure_cursor_in_view_center(doc, self.config.load().scrolloff);
     }
+
+    #[inline]
+    pub fn focused_document_index(&self) -> usize {
+        self.documents
+            .get_index_of(&view!(self).doc)
+            .expect("focused document should always be present")
+    }
 }
 
 fn try_restore_indent(doc: &mut Document, view: &mut View) {
