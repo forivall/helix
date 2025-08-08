@@ -15,7 +15,7 @@ use helix_loader::VERSION_AND_GIT_HASH;
 use helix_stdx::path;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::{collections::HashMap, path::PathBuf};
 use std::{
     ffi::OsStr,
@@ -203,7 +203,7 @@ impl Client {
     pub fn start(
         cmd: &str,
         args: &[String],
-        config: Option<Value>,
+        mut config: Option<Value>,
         server_environment: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
         root_path: PathBuf,
         root_uri: Option<lsp::Url>,
@@ -243,6 +243,32 @@ impl Client {
             .clone()
             .map(|root| vec![workspace_for_uri(root)])
             .unwrap_or_default();
+
+        if let Some(primary_folder) = workspace_folders.get(0) {
+            if let Value::Object(config_map) =
+                config.get_or_insert_with(|| Value::Object(Map::new()))
+            {
+                if config_map
+                    .get("workspaceFolder")
+                    .is_none_or(|v| v.as_object().is_some_and(|o| o.is_empty()))
+                {
+                    let mut workspace_folder_map = Map::new();
+                    workspace_folder_map.insert(
+                        "name".into(),
+                        Value::String(primary_folder.name.clone().into()),
+                    );
+                    workspace_folder_map.insert(
+                        "uri".into(),
+                        Value::String(primary_folder.uri.as_str().into()),
+                    );
+                    config_map.insert(
+                        "workspaceFolder".into(),
+                        Value::Object(workspace_folder_map),
+                    );
+                    config = Some(Value::Object(config_map.to_owned()));
+                }
+            }
+        }
 
         let client = Self {
             id,
