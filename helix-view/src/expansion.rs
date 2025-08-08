@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, path::Component};
 
 use helix_core::command_line::{ExpansionKind, Token, TokenKind, Tokenizer};
 
@@ -31,6 +31,8 @@ pub enum Variable {
     ///
     /// This corresponds to `crate::Document::display_name`.
     BufferName,
+    /// The directory of the currently focused document.
+    BufferDirname,
     /// A string containing the line-ending of the currently focused document.
     LineEnding,
     /// Curreng working directory
@@ -66,6 +68,7 @@ impl Variable {
             Self::CursorLine => "cursor_line",
             Self::CursorColumn => "cursor_column",
             Self::BufferName => "buffer_name",
+            Self::BufferDirname => "buffer_dirname",
             Self::LineEnding => "line_ending",
             Self::CurrentWorkingDirectory => "current_working_directory",
             Self::WorkspaceDirectory => "workspace_directory",
@@ -81,6 +84,7 @@ impl Variable {
             "cursor_line" => Some(Self::CursorLine),
             "cursor_column" => Some(Self::CursorColumn),
             "buffer_name" => Some(Self::BufferName),
+            "buffer_dirname" => Some(Self::BufferDirname),
             "line_ending" => Some(Self::LineEnding),
             "workspace_directory" => Some(Self::WorkspaceDirectory),
             "current_working_directory" => Some(Self::CurrentWorkingDirectory),
@@ -243,6 +247,14 @@ fn expand_variable(editor: &Editor, variable: Variable) -> Result<Cow<'static, s
             } else {
                 Ok(Cow::Borrowed(crate::document::SCRATCH_BUFFER_NAME))
             }
+        }
+        Variable::BufferDirname => {
+            if let Some(path) = doc.relative_path().and_then(|f| f.parent()) {
+                if path.as_os_str().is_empty() {
+                    return Ok(Cow::Owned(path.to_string_lossy().into_owned()));
+                }
+            }
+            Ok(Component::CurDir.as_os_str().to_string_lossy())
         }
         Variable::LineEnding => Ok(Cow::Borrowed(doc.line_ending.as_str())),
         Variable::CurrentWorkingDirectory => Ok(std::borrow::Cow::Owned(
