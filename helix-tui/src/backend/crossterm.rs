@@ -187,7 +187,6 @@ where
         }
         Ok(())
     }
-
     fn reconfigure(&mut self, config: Config) -> io::Result<()> {
         if self.mouse_capture_enabled != config.enable_mouse_capture {
             if config.enable_mouse_capture {
@@ -201,7 +200,6 @@ where
 
         Ok(())
     }
-
     fn restore(&mut self) -> io::Result<()> {
         // reset cursor shape
         self.buffer
@@ -222,7 +220,6 @@ where
         )?;
         terminal::disable_raw_mode()
     }
-
     fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
@@ -287,11 +284,9 @@ where
             SetAttribute(CAttribute::Reset)
         )
     }
-
     fn hide_cursor(&mut self) -> io::Result<()> {
         execute!(self.buffer, Hide)
     }
-
     fn show_cursor(&mut self, kind: CursorKind) -> io::Result<()> {
         let shape = match kind {
             CursorKind::Block => SetCursorStyle::SteadyBlock,
@@ -301,32 +296,39 @@ where
         };
         execute!(self.buffer, Show, shape)
     }
-
     fn set_cursor(&mut self, x: u16, y: u16) -> io::Result<()> {
         execute!(self.buffer, MoveTo(x, y))
     }
-
     fn clear(&mut self) -> io::Result<()> {
         execute!(self.buffer, Clear(ClearType::All))
     }
-
     fn size(&self) -> io::Result<Rect> {
         let (width, height) =
             terminal::size().map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         Ok(Rect::new(0, 0, width, height))
     }
-
     fn flush(&mut self) -> io::Result<()> {
         self.buffer.flush()
     }
-
     fn supports_true_color(&self) -> bool {
         false
     }
-
     fn get_theme_mode(&self) -> Option<helix_view::theme::Mode> {
         None
+    }
+    fn force_restore() -> io::Result<()> {
+        let mut stdout = io::stdout();
+
+        // reset cursor shape
+        write!(stdout, "\x1B[0 q")?;
+        // Ignore errors on disabling, this might trigger on windows if we call
+        // disable without calling enable previously
+        let _ = execute!(stdout, DisableMouseCapture);
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        let _ = execute!(stdout, DisableBracketedPaste);
+        execute!(stdout, DisableFocusChange, terminal::LeaveAlternateScreen)?;
+        terminal::disable_raw_mode()
     }
 }
 

@@ -6,10 +6,10 @@ use crate::{buffer::Cell, terminal::Config};
 
 use helix_view::graphics::{CursorKind, Rect};
 
-#[cfg(all(feature = "termina", not(windows)))]
-mod termina;
-#[cfg(all(feature = "termina", not(windows)))]
-pub use self::termina::TerminaBackend;
+#[cfg(feature = "crossterm")]
+mod crossterm;
+#[cfg(feature = "crossterm")]
+pub use self::crossterm::CrosstermBackend;
 
 #[cfg(all(feature = "termina", windows))]
 mod crossterm;
@@ -27,6 +27,8 @@ pub trait Backend {
     fn reconfigure(&mut self, config: Config) -> Result<(), io::Error>;
     /// Restores the terminal to a normal state, undoes `claim`
     fn restore(&mut self) -> Result<(), io::Error>;
+    /// Forcibly resets the terminal, ignoring errors and configuration
+    fn force_restore() -> Result<(), io::Error>;
     /// Draws styled text to the terminal
     fn draw<'a, I>(&mut self, content: I) -> Result<(), io::Error>
     where

@@ -2,6 +2,7 @@
 pub mod macros;
 
 pub mod annotations;
+pub mod base64;
 pub mod clipboard;
 pub mod document;
 pub mod editor;
