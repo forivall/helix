@@ -698,7 +698,16 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                                     path.clone(),
                                 );
                             }
-                            if let Some(diff_base) = editor.diff_providers.get_diff_base(&path) {
+                            let trust_full = editor
+                                .workspace_trust
+                                .query(
+                                    doc.workspace_root(),
+                                    helix_loader::workspace_trust::TrustQuery::Git,
+                                )
+                                .is_trusted();
+                            if let Some(diff_base) =
+                                editor.diff_providers.get_diff_base(&path, trust_full)
+                            {
                                 doc.set_diff_base(diff_base);
                             }
                             Ok(CachedPreview::Document(Box::new(doc)))
