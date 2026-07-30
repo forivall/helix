@@ -3577,7 +3577,7 @@ fn changed_file_picker(cx: &mut Context) {
                 range = Some(hrange.line_range(doc.text().slice(..)));
             }
         }
-        Some((path.as_path().into(), range))
+        Some((path.into(), range))
     });
     let injector = picker.injector();
 
