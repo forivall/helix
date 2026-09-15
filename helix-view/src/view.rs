@@ -1,8 +1,8 @@
 use crate::{
     align_view,
-    annotations::diagnostics::InlineDiagnostics,
+    annotations::{diagnostics::InlineDiagnostics, plugins::PluginLineAnnotations},
     document::{DocumentColorSwatches, DocumentInlayHints},
-    editor::{GutterConfig, GutterType},
+    editor::{GutterConfig, GutterType, ScrolloffConfig},
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
     Align, Document, DocumentId, Theme, ViewId,
@@ -12,10 +12,12 @@ use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
     text_annotations::TextAnnotations,
+    text_folding::{FoldAnnotations, RopeSliceFoldExt},
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
     Transaction,
     VisualOffsetError::{PosAfterMaxRow, PosBeforeAnchorRow},
 };
+use serde::{Deserialize, Serialize};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -135,7 +137,7 @@ impl JumpList {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Copy, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Copy, Default, Serialize, Deserialize)]
 pub struct ViewPosition {
     pub anchor: usize,
     pub horizontal_offset: usize,
@@ -207,12 +209,31 @@ impl View {
         self.docs_access_history.push(id);
     }
 
-    pub fn inner_area(&self, doc: &Document) -> Rect {
-        self.area.clip_left(self.gutter_offset(doc)).clip_bottom(1) // -1 for statusline
+    /// The range of lines in the document that the view sees
+    pub fn line_range(&self, doc: &Document) -> std::ops::Range<usize> {
+        let text = doc.text();
+        let text_line_count = text.len_lines();
+        let first_line = text.char_to_line(doc.view_offset(self.id).anchor.min(text.len_chars()));
+        let last_line = first_line
+            .saturating_add(self.inner_height(doc))
+            .min(text_line_count);
+
+        first_line..last_line
     }
 
-    pub fn inner_height(&self) -> usize {
-        self.area.clip_bottom(1).height.into() // -1 for statusline
+    pub fn inner_area(&self, doc: &Document) -> Rect {
+        self.area
+            .clip_top(self.breadcrumb_offset(doc))
+            .clip_left(self.gutter_offset(doc))
+            .clip_bottom(1) // -1 for statusline
+    }
+
+    pub fn inner_height(&self, doc: &Document) -> usize {
+        self.area
+            .clip_top(self.breadcrumb_offset(doc))
+            .clip_bottom(1) // -1 for statusline
+            .height
+            .into()
     }
 
     pub fn inner_width(&self, doc: &Document) -> u16 {
@@ -237,11 +258,16 @@ impl View {
         }
     }
 
+    /// Height in rows taken by the breadcrumb bar (0 or 1).
+    pub fn breadcrumb_offset(&self, doc: &Document) -> u16 {
+        u16::from(doc.config.load().breadcrumb.enable)
+    }
+
     //
     pub fn offset_coords_to_in_view(
         &self,
         doc: &Document,
-        scrolloff: usize,
+        scrolloff: ScrolloffConfig,
     ) -> Option<ViewPosition> {
         self.offset_coords_to_in_view_center::<false>(doc, scrolloff)
     }
@@ -249,7 +275,7 @@ impl View {
     pub fn offset_coords_to_in_view_center<const CENTERING: bool>(
         &self,
         doc: &Document,
-        scrolloff: usize,
+        scrolloff: ScrolloffConfig,
     ) -> Option<ViewPosition> {
         let view_offset = doc.get_view_offset(self.id)?;
         let doc_text = doc.text().slice(..);
@@ -263,8 +289,10 @@ impl View {
         } else {
             (
                 // - 1 from the top so we have at least one gap in the middle.
-                scrolloff.min(viewport.height.saturating_sub(1) as usize / 2),
-                scrolloff.min(viewport.height as usize / 2),
+                scrolloff
+                    .vertical
+                    .min(viewport.height.saturating_sub(1) as usize / 2),
+                scrolloff.vertical.min(viewport.height as usize / 2),
             )
         };
         let (scrolloff_left, scrolloff_right) = if CENTERING {
@@ -272,8 +300,10 @@ impl View {
         } else {
             (
                 // - 1 from the left so we have at least one gap in the middle.
-                scrolloff.min(viewport.width.saturating_sub(1) as usize / 2),
-                scrolloff.min(viewport.width as usize / 2),
+                scrolloff
+                    .horizontal
+                    .min(viewport.width.saturating_sub(1) as usize / 2),
+                scrolloff.horizontal.min(viewport.width as usize / 2),
             )
         };
 
@@ -350,13 +380,13 @@ impl View {
         Some(offset)
     }
 
-    pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: usize) {
+    pub fn ensure_cursor_in_view(&self, doc: &mut Document, scrolloff: ScrolloffConfig) {
         if let Some(offset) = self.offset_coords_to_in_view_center::<false>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         }
     }
 
-    pub fn ensure_cursor_in_view_center(&self, doc: &mut Document, scrolloff: usize) {
+    pub fn ensure_cursor_in_view_center(&self, doc: &mut Document, scrolloff: ScrolloffConfig) {
         if let Some(offset) = self.offset_coords_to_in_view_center::<true>(doc, scrolloff) {
             doc.set_view_offset(self.id, offset);
         } else {
@@ -364,7 +394,7 @@ impl View {
         }
     }
 
-    pub fn is_cursor_in_view(&mut self, doc: &Document, scrolloff: usize) -> bool {
+    pub fn is_cursor_in_view(&mut self, doc: &Document, scrolloff: ScrolloffConfig) -> bool {
         self.offset_coords_to_in_view(doc, scrolloff).is_none()
     }
 
@@ -374,13 +404,14 @@ impl View {
     /// The actual last visible line may be smaller if softwrapping occurs
     /// or virtual text lines are visible
     #[inline]
-    pub fn estimate_last_doc_line(&self, doc: &Document) -> usize {
+    pub fn estimate_last_doc_line(&self, annotations: &TextAnnotations, doc: &Document) -> usize {
         let doc_text = doc.text().slice(..);
         let line = doc_text.char_to_line(doc.view_offset(self.id).anchor.min(doc_text.len_chars()));
-        // Saturating subs to make it inclusive zero indexing.
-        (line + self.inner_height())
-            .min(doc_text.len_lines())
-            .saturating_sub(1)
+        doc_text.nth_next_folded_line(
+            &annotations.folds,
+            line,
+            self.inner_height(doc).saturating_sub(1),
+        )
     }
 
     /// Calculates the last non-empty visual line on screen
@@ -396,7 +427,7 @@ impl View {
         let visual_height = doc.view_offset(self.id).vertical_offset + viewport.height as usize;
 
         // fast path when the EOF is not visible on the screen,
-        if self.estimate_last_doc_line(doc) < doc_text.len_lines() - 1 {
+        if self.estimate_last_doc_line(&annotations, doc) < doc_text.len_lines() - 1 {
             return visual_height.saturating_sub(1);
         }
 
@@ -529,6 +560,17 @@ impl View {
         }
 
         text_annotations
+            .add_line_annotation(Box::new(PluginLineAnnotations::new(doc, self.id, width)));
+
+        if let Some(fold_container) = doc.fold_container(self.id) {
+            text_annotations.add_folds(fold_container);
+        }
+
+        text_annotations
+    }
+
+    pub fn fold_annotations<'a>(&self, doc: &'a Document) -> FoldAnnotations<'a> {
+        FoldAnnotations::new(doc.fold_container(self.id))
     }
 
     pub fn text_pos_at_screen_coords(

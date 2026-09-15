@@ -17,12 +17,13 @@ pub struct Overlay<T> {
     pub calc_child_size: Box<dyn Fn(Rect) -> Rect>,
 }
 
-/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom
-pub fn overlaid<T>(content: T) -> Overlay<T> {
+/// Surrounds the component with a margin of 5% on each side, and an additional 2 rows at the bottom.
+/// When `fullscreen` is true, uses full screen width on terminals narrower than `FULL_OVERLAID_MAX_WIDTH`.
+pub fn overlaid<T>(content: T, fullscreen: bool) -> Overlay<T> {
     Overlay {
         content,
-        calc_child_size: Box::new(|rect: Rect| {
-            let percentage = if rect.width < FULL_OVERLAID_MAX_WIDTH {
+        calc_child_size: Box::new(move |rect: Rect| {
+            let percentage = if fullscreen && rect.width < FULL_OVERLAID_MAX_WIDTH {
                 100
             } else {
                 90
@@ -32,7 +33,7 @@ pub fn overlaid<T>(content: T) -> Overlay<T> {
     }
 }
 
-fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
+pub fn clip_rect_relative(rect: Rect, percent_horizontal: u8, percent_vertical: u8) -> Rect {
     fn mul_and_cast(size: u16, factor: u8) -> u16 {
         ((size as u32) * (factor as u32) / 100).try_into().unwrap()
     }

@@ -21,7 +21,7 @@ use unicode_segmentation::{Graphemes, UnicodeSegmentation};
 
 use helix_stdx::rope::{RopeGraphemes, RopeSliceExt};
 
-use crate::graphemes::{Grapheme, GraphemeStr};
+use crate::graphemes::{next_grapheme_boundary, Grapheme, GraphemeStr};
 use crate::syntax::Highlight;
 use crate::text_annotations::TextAnnotations;
 use crate::{Position, RopeSlice};
@@ -147,7 +147,6 @@ pub struct TextFormat {
     pub tab_width: u16,
     pub max_wrap: u16,
     pub max_indent_retain: u16,
-    pub wrap_indicator: Box<str>,
     pub wrap_indicator_highlight: Option<Highlight>,
     pub viewport_width: u16,
     pub soft_wrap_at_text_width: bool,
@@ -161,7 +160,6 @@ impl Default for TextFormat {
             tab_width: 4,
             max_wrap: 3,
             max_indent_retain: 4,
-            wrap_indicator: Box::from(" "),
             viewport_width: 17,
             wrap_indicator_highlight: None,
             soft_wrap_at_text_width: false,
@@ -171,6 +169,8 @@ impl Default for TextFormat {
 
 #[derive(Debug)]
 pub struct DocumentFormatter<'t> {
+    text: RopeSlice<'t>,
+
     text_fmt: &'t TextFormat,
     annotations: &'t TextAnnotations<'t>,
 
@@ -209,14 +209,23 @@ impl<'t> DocumentFormatter<'t> {
         text: RopeSlice<'t>,
         text_fmt: &'t TextFormat,
         annotations: &'t TextAnnotations,
-        char_idx: usize,
+        mut char_idx: usize,
     ) -> Self {
+        // if `char_idx` is folded restore its value to the starting char of the block
+        if let Some(fold) = annotations
+            .folds
+            .superest_fold_containing(char_idx, |fold| fold.start.char..=fold.end.char)
+        {
+            char_idx = fold.start.char
+        }
+
         // TODO divide long lines into blocks to avoid bad performance for long lines
         let block_line_idx = text.char_to_line(char_idx.min(text.len_chars()));
         let block_char_idx = text.line_to_char(block_line_idx);
         annotations.reset_pos(block_char_idx);
 
         DocumentFormatter {
+            text,
             text_fmt,
             annotations,
             visual_pos: Position { row: 0, col: 0 },
@@ -258,7 +267,15 @@ impl<'t> DocumentFormatter<'t> {
         }
     }
 
-    fn advance_grapheme(&mut self, col: usize, char_pos: usize) -> Option<GraphemeWithSource<'t>> {
+    fn advance_grapheme(
+        &mut self,
+        col: usize,
+        mut char_pos: usize,
+    ) -> Option<GraphemeWithSource<'t>> {
+        if let Some(folded_chars) = self.skip_folded_chars(char_pos) {
+            char_pos += folded_chars;
+        }
+
         let (grapheme, source) =
             if let Some((grapheme, highlight)) = self.next_inline_annotation_grapheme(char_pos) {
                 (grapheme.into(), GraphemeSource::VirtualText { highlight })
@@ -290,6 +307,31 @@ impl<'t> DocumentFormatter<'t> {
         Some(grapheme)
     }
 
+    fn skip_folded_chars(&mut self, char_pos: usize) -> Option<usize> {
+        let (folded_chars, folded_lines) = self
+            .annotations
+            .folds
+            .consume_next(char_pos, |fold| fold.start.char)
+            .map(|fold| {
+                (
+                    next_grapheme_boundary(self.text, fold.end.char) - fold.start.char,
+                    fold.end.line - fold.start.line + 1,
+                )
+            })?;
+
+        if char_pos + folded_chars < self.text.len_chars() {
+            self.graphemes = self.text.slice(char_pos + folded_chars..).graphemes();
+        } else {
+            self.graphemes = RopeSlice::from("").graphemes();
+        }
+        self.annotations.reset_pos(char_pos + folded_chars);
+
+        self.char_pos += folded_chars;
+        self.line_pos += folded_lines;
+
+        Some(folded_chars)
+    }
+
     /// Move a word to the next visual line
     fn wrap_word(&mut self) -> usize {
         // softwrap this word to the next line
@@ -310,25 +352,8 @@ impl<'t> DocumentFormatter<'t> {
                 .virtual_lines_at(self.char_pos, self.visual_pos, self.line_pos);
         self.visual_pos.col = indent_carry_over as usize;
         self.visual_pos.row += 1 + virtual_lines;
-        let mut i = 0;
         let mut word_width = 0;
-        let wrap_indicator = UnicodeSegmentation::graphemes(&*self.text_fmt.wrap_indicator, true)
-            .map(|g| {
-                i += 1;
-                let grapheme = GraphemeWithSource::new(
-                    g.into(),
-                    self.visual_pos.col + word_width,
-                    self.text_fmt.tab_width,
-                    GraphemeSource::VirtualText {
-                        highlight: self.text_fmt.wrap_indicator_highlight,
-                    },
-                );
-                word_width += grapheme.width();
-                grapheme
-            });
-        self.word_buf.splice(0..0, wrap_indicator);
-
-        for grapheme in &mut self.word_buf[i..] {
+        for grapheme in &mut self.word_buf {
             let visual_x = self.visual_pos.col + word_width;
             grapheme
                 .grapheme

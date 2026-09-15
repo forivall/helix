@@ -214,9 +214,13 @@ pub fn syntax_symbol_picker(cx: &mut Context) {
     .with_preview(|_editor, tag| {
         Some((tag.doc.path_or_id()?, Some((tag.start_line, tag.end_line))))
     })
-    .truncate_start(false);
+    .truncate_start(false)
+    .with_title("Document Symbols");
 
-    cx.push_layer(Box::new(overlaid(picker)));
+    cx.push_layer(Box::new(overlaid(
+        picker,
+        cx.editor.config().fullscreen_overlay,
+    )));
 }
 
 pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
@@ -378,7 +382,7 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
                         return WalkState::Continue;
                     };
                     let mut quit = false;
-                    let sink = sinks::UTF8(|_line, _content| {
+                    let sink = sinks::Lossy(|_line, _content| {
                         if !syntax_cache.contains_key(path) {
                             // Read the file into a Rope and attempt to recognize the language
                             // and parse it with tree-sitter. Save the Rope and Syntax for future
@@ -461,8 +465,12 @@ pub fn syntax_workspace_symbol_picker(cx: &mut Context) {
         ))
     })
     .with_history_register(Some(reg))
-    .truncate_start(false);
-    cx.push_layer(Box::new(overlaid(picker)));
+    .truncate_start(false)
+    .with_title("Workspace Symbols");
+    cx.push_layer(Box::new(overlaid(
+        picker,
+        cx.editor.config().fullscreen_overlay,
+    )));
 }
 
 /// Create a Rope and language config for a given existing path without creating a full Document.

@@ -47,10 +47,9 @@ const fn byte_from_hex(mut h: [u8; 2]) -> Option<u8> {
     Some((h[0] << 4) | h[1])
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 /// UNSTABLE
-#[derive(Default)]
 pub enum CursorKind {
     /// █
     #[default]
@@ -198,6 +197,12 @@ impl Rect {
             height: self.height.saturating_sub(height),
             ..self
         }
+    }
+
+    #[inline]
+    pub fn with_y(self, y: u16) -> Rect {
+        // new y may make area > u16::max_value, so use new()
+        Self::new(self.x, y, self.width, self.height)
     }
 
     pub fn with_height(self, height: u16) -> Rect {

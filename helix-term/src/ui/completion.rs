@@ -9,6 +9,9 @@ use crate::{
 use helix_core::snippets::{ActiveSnippet, RenderedSnippet, Snippet};
 use helix_core::{self as core, chars, fuzzy::MATCHER, Change, Transaction};
 use helix_lsp::{lsp, util, OffsetEncoding};
+use helix_view::editor::CompletionHighlightType;
+use helix_view::icons::ICONS;
+use helix_view::Theme;
 use helix_view::{
     editor::CompleteAction,
     handlers::lsp::SignatureHelpInvoked,
@@ -20,15 +23,24 @@ use nucleo::{
     pattern::{Atom, AtomKind, CaseMatching, Normalization},
     Config, Utf32Str,
 };
-use tui::text::Spans;
-use tui::{buffer::Buffer as Surface, text::Span};
+use tui::{
+    buffer::Buffer as Surface,
+    text::{Span, Spans},
+    widgets::BorderType,
+};
 
 use std::cmp::Reverse;
 
-impl menu::Item for CompletionItem {
-    type Data = Style;
+#[derive(Clone, Debug)]
+pub struct FormatCompletionData {
+    theme: Theme,
+    completion_highlight_type: CompletionHighlightType,
+}
 
-    fn format(&self, dir_style: &Self::Data) -> menu::Row<'_> {
+impl menu::Item for CompletionItem {
+    type Data = FormatCompletionData;
+
+    fn format(&self, format_completion_data: &Self::Data) -> menu::Row<'_> {
         let deprecated = match self {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => {
                 item.deprecated.unwrap_or_default()
@@ -45,7 +57,7 @@ impl menu::Item for CompletionItem {
             CompletionItem::Other(core::CompletionItem { label, .. }) => label,
         };
 
-        let kind = match self {
+        let mut kind = match self {
             CompletionItem::Lsp(LspCompletionItem { item, .. }) => match item.kind {
                 Some(lsp::CompletionItemKind::TEXT) => "text".into(),
                 Some(lsp::CompletionItemKind::METHOD) => "method".into(),
@@ -78,9 +90,13 @@ impl menu::Item for CompletionItem {
                     })
                     .and_then(|c| Color::from_hex(c).ok())
                     .map_or("color".into(), |color| {
+                        let icons = ICONS.load();
                         Spans::from(vec![
                             Span::raw("color "),
-                            Span::styled("■", Style::default().fg(color)),
+                            Span::styled(
+                                icons.kind().color().glyph().to_string(),
+                                Style::default().fg(color),
+                            ),
                         ])
                     }),
                 Some(lsp::CompletionItemKind::FILE) => "file".into(),
@@ -101,16 +117,53 @@ impl menu::Item for CompletionItem {
             CompletionItem::Other(core::CompletionItem { kind, .. }) => kind.as_ref().into(),
         };
 
-        let label = Span::styled(
-            label,
-            if deprecated {
-                Style::default().add_modifier(Modifier::CROSSED_OUT)
-            } else if kind.0[0].content == "folder" {
-                *dir_style
-            } else {
-                Style::default()
-            },
-        );
+        let icons = ICONS.load();
+        let name = &kind.0[0].content.clone();
+
+        let is_folder = kind.0[0].content == "folder";
+
+        let highlight_type = format_completion_data.completion_highlight_type;
+        let theme = format_completion_data.theme.clone();
+        let style = theme
+            .try_get(&format!("completion.{}", name))
+            .or_else(|| theme.try_get(name))
+            .unwrap_or_else(|| theme.get("ui.text"));
+
+        let mut color: Option<Color> = None;
+
+        match highlight_type {
+            CompletionHighlightType::Default => {
+                if let Some(icon) = icons.kind().get(name) {
+                    color = icon.color();
+                }
+            }
+            CompletionHighlightType::ThemeColors => color = style.fg,
+
+            CompletionHighlightType::Vibrant => {
+                color = style.fg.map(|color| derive_color(color, name));
+            }
+        }
+
+        if let Some(color) = color {
+            kind.0[0].style = Style::default().fg(color);
+        } else if is_folder {
+            kind.0[0].style = theme.get("ui.text.directory");
+        }
+
+        if let Some(icon) = icons.kind().get(name) {
+            kind.0[0].content = format!("{}  {name}", icon.glyph()).into();
+        } else {
+            kind.0[0].content = format!("{name}").into();
+        }
+
+        let label_style = if deprecated {
+            Style::default().add_modifier(Modifier::CROSSED_OUT)
+        } else if is_folder {
+            theme.get("ui.text.directory")
+        } else {
+            Style::default()
+        };
+        let label = Span::styled(label, label_style);
 
         menu::Row::new([menu::Cell::from(label), menu::Cell::from(kind)])
     }
@@ -133,13 +186,20 @@ impl Completion {
         let preview_completion_insert = editor.config().preview_completion_insert;
         let replace_mode = editor.config().completion_replace;
 
-        let dir_style = editor.theme.get("ui.text.directory");
-
+        let theme = editor.theme.clone();
+        let completion_highlight_type = editor.config().completion_highlight.highlight_type;
+        let format_completion_data = FormatCompletionData {
+            theme,
+            completion_highlight_type,
+        };
         // Then create the menu
-        let menu = Menu::new(items, dir_style, move |editor: &mut Editor, item, event| {
-            let (view, doc) = current!(editor);
+        let menu = Menu::new(
+            items,
+            format_completion_data,
+            move |editor: &mut Editor, item, event| {
+                let (view, doc) = current!(editor);
 
-            macro_rules! language_server {
+                macro_rules! language_server {
                 ($item:expr) => {
                     match editor
                         .language_servers
@@ -156,139 +216,142 @@ impl Completion {
                 };
             }
 
-            match event {
-                PromptEvent::Abort => {}
-                PromptEvent::Update if preview_completion_insert => {
-                    // Update creates "ghost" transactions which are not sent to the
-                    // lsp server to avoid messing up re-requesting completions. Once a
-                    // completion has been selected (with tab, c-n or c-p) it's always accepted whenever anything
-                    // is typed. The only way to avoid that is to explicitly abort the completion
-                    // with c-c. This will remove the "ghost" transaction.
-                    //
-                    // The ghost transaction is modeled with a transaction that is not sent to the LS.
-                    // (apply_temporary) and a savepoint. It's extremely important this savepoint is restored
-                    // (also without sending the transaction to the LS) *before any further transaction is applied*.
-                    // Otherwise incremental sync breaks (since the state of the LS doesn't match the state the transaction
-                    // is applied to).
-                    if matches!(editor.last_completion, Some(CompleteAction::Triggered)) {
-                        editor.last_completion = Some(CompleteAction::Selected {
-                            savepoint: doc.savepoint(view),
-                        })
-                    }
-                    let item = item.unwrap();
-                    let context = &editor.handlers.completions.active_completions[&item.provider()];
-                    // if more text was entered, remove it
-                    doc.restore(view, &context.savepoint, false);
-                    // always present here
-
-                    match item {
-                        CompletionItem::Lsp(item) => {
-                            let (transaction, _) = lsp_item_to_transaction(
-                                doc,
-                                view.id,
-                                &item.item,
-                                language_server!(item).offset_encoding(),
-                                trigger_offset,
-                                replace_mode,
-                            );
-                            doc.apply_temporary(&transaction, view.id)
+                match event {
+                    PromptEvent::Abort => {}
+                    PromptEvent::Update if preview_completion_insert => {
+                        // Update creates "ghost" transactions which are not sent to the
+                        // lsp server to avoid messing up re-requesting completions. Once a
+                        // completion has been selected (with tab, c-n or c-p) it's always accepted whenever anything
+                        // is typed. The only way to avoid that is to explicitly abort the completion
+                        // with c-c. This will remove the "ghost" transaction.
+                        //
+                        // The ghost transaction is modeled with a transaction that is not sent to the LS.
+                        // (apply_temporary) and a savepoint. It's extremely important this savepoint is restored
+                        // (also without sending the transaction to the LS) *before any further transaction is applied*.
+                        // Otherwise incremental sync breaks (since the state of the LS doesn't match the state the transaction
+                        // is applied to).
+                        if matches!(editor.last_completion, Some(CompleteAction::Triggered)) {
+                            editor.last_completion = Some(CompleteAction::Selected {
+                                savepoint: doc.savepoint(view),
+                            })
                         }
-                        CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
-                            doc.apply_temporary(transaction, view.id)
-                        }
-                    };
-                }
-                PromptEvent::Update => {}
-                PromptEvent::Validate => {
-                    if let Some(CompleteAction::Selected { savepoint }) =
-                        editor.last_completion.take()
-                    {
-                        doc.restore(view, &savepoint, false);
-                    }
+                        let item = item.unwrap();
+                        let context =
+                            &editor.handlers.completions.active_completions[&item.provider()];
+                        // if more text was entered, remove it
+                        doc.restore(view, &context.savepoint, false);
+                        // always present here
 
-                    let item = item.unwrap();
-                    let context = &editor.handlers.completions.active_completions[&item.provider()];
-                    // if more text was entered, remove it
-                    doc.restore(view, &context.savepoint, true);
-                    // save an undo checkpoint before the completion
-                    doc.append_changes_to_history(view);
-
-                    // item always present here
-                    let (transaction, additional_edits, snippet) = match item.clone() {
-                        CompletionItem::Lsp(mut item) => {
-                            let language_server = language_server!(item);
-
-                            // resolve item if not yet resolved
-                            if !item.resolved {
-                                if let Some(resolved_item) = Self::resolve_completion_item(
-                                    language_server,
-                                    item.item.clone(),
-                                ) {
-                                    item.item = resolved_item;
-                                }
-                            };
-
-                            let encoding = language_server.offset_encoding();
-                            let (transaction, snippet) = lsp_item_to_transaction(
-                                doc,
-                                view.id,
-                                &item.item,
-                                encoding,
-                                trigger_offset,
-                                replace_mode,
-                            );
-                            let add_edits = item.item.additional_text_edits;
-
-                            (
-                                transaction,
-                                add_edits.map(|edits| (edits, encoding)),
-                                snippet,
-                            )
-                        }
-                        CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
-                            (transaction, None, None)
-                        }
-                    };
-
-                    doc.apply(&transaction, view.id);
-                    let placeholder = snippet.is_some();
-                    if let Some(snippet) = snippet {
-                        doc.active_snippet = match doc.active_snippet.take() {
-                            Some(active) => active.insert_subsnippet(snippet),
-                            None => ActiveSnippet::new(snippet),
+                        match item {
+                            CompletionItem::Lsp(item) => {
+                                let (transaction, _) = lsp_item_to_transaction(
+                                    doc,
+                                    view.id,
+                                    &item.item,
+                                    language_server!(item).offset_encoding(),
+                                    trigger_offset,
+                                    replace_mode,
+                                );
+                                doc.apply_temporary(&transaction, view.id)
+                            }
+                            CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
+                                doc.apply_temporary(transaction, view.id)
+                            }
                         };
                     }
-
-                    editor.last_completion = Some(CompleteAction::Applied {
-                        trigger_offset,
-                        changes: completion_changes(&transaction, trigger_offset),
-                        placeholder,
-                    });
-
-                    // TODO: add additional _edits to completion_changes?
-                    if let Some((additional_edits, offset_encoding)) = additional_edits {
-                        if !additional_edits.is_empty() {
-                            let transaction = util::generate_transaction_from_edits(
-                                doc.text(),
-                                additional_edits,
-                                offset_encoding, // TODO: should probably transcode in Client
-                            );
-                            doc.apply(&transaction, view.id);
+                    PromptEvent::Update => {}
+                    PromptEvent::Validate => {
+                        if let Some(CompleteAction::Selected { savepoint }) =
+                            editor.last_completion.take()
+                        {
+                            doc.restore(view, &savepoint, false);
                         }
-                    }
-                    // we could have just inserted a trigger char (like a `crate::` completion for rust
-                    // so we want to retrigger immediately when accepting a completion.
-                    trigger_auto_completion(editor, true);
-                }
-            };
 
-            // In case the popup was deleted because of an intersection w/ the auto-complete menu.
-            if event != PromptEvent::Update {
-                editor
-                    .handlers
-                    .trigger_signature_help(SignatureHelpInvoked::Automatic, editor);
-            }
-        });
+                        let item = item.unwrap();
+                        let context =
+                            &editor.handlers.completions.active_completions[&item.provider()];
+                        // if more text was entered, remove it
+                        doc.restore(view, &context.savepoint, true);
+                        // save an undo checkpoint before the completion
+                        doc.append_changes_to_history(view);
+
+                        // item always present here
+                        let (transaction, additional_edits, snippet) = match item.clone() {
+                            CompletionItem::Lsp(mut item) => {
+                                let language_server = language_server!(item);
+
+                                // resolve item if not yet resolved
+                                if !item.resolved {
+                                    if let Some(resolved_item) = Self::resolve_completion_item(
+                                        language_server,
+                                        item.item.clone(),
+                                    ) {
+                                        item.item = resolved_item;
+                                    }
+                                };
+
+                                let encoding = language_server.offset_encoding();
+                                let (transaction, snippet) = lsp_item_to_transaction(
+                                    doc,
+                                    view.id,
+                                    &item.item,
+                                    encoding,
+                                    trigger_offset,
+                                    replace_mode,
+                                );
+                                let add_edits = item.item.additional_text_edits;
+
+                                (
+                                    transaction,
+                                    add_edits.map(|edits| (edits, encoding)),
+                                    snippet,
+                                )
+                            }
+                            CompletionItem::Other(core::CompletionItem { transaction, .. }) => {
+                                (transaction, None, None)
+                            }
+                        };
+
+                        doc.apply(&transaction, view.id);
+                        let placeholder = snippet.is_some();
+                        if let Some(snippet) = snippet {
+                            doc.active_snippet = match doc.active_snippet.take() {
+                                Some(active) => active.insert_subsnippet(snippet),
+                                None => ActiveSnippet::new(snippet),
+                            };
+                        }
+
+                        editor.last_completion = Some(CompleteAction::Applied {
+                            trigger_offset,
+                            changes: completion_changes(&transaction, trigger_offset),
+                            placeholder,
+                        });
+
+                        // TODO: add additional _edits to completion_changes?
+                        if let Some((additional_edits, offset_encoding)) = additional_edits {
+                            if !additional_edits.is_empty() {
+                                let transaction = util::generate_transaction_from_edits(
+                                    doc.text(),
+                                    additional_edits,
+                                    offset_encoding, // TODO: should probably transcode in Client
+                                );
+                                doc.apply(&transaction, view.id);
+                            }
+                        }
+                        // we could have just inserted a trigger char (like a `crate::` completion for rust
+                        // so we want to retrigger immediately when accepting a completion.
+                        trigger_auto_completion(editor, true);
+                    }
+                };
+
+                // In case the popup was deleted because of an intersection w/ the auto-complete menu.
+                if event != PromptEvent::Update {
+                    editor
+                        .handlers
+                        .trigger_signature_help(SignatureHelpInvoked::Automatic, editor);
+                }
+            },
+        );
 
         let popup = Popup::new(Self::ID, menu)
             .with_scrollbar(false)
@@ -369,7 +432,13 @@ impl Completion {
         let min_score = (7 + pattern.needle_text().len() as u32 * 14) / 3;
         matches.sort_unstable_by_key(|&(i, score)| {
             let option = &options[i as usize];
+            let filter_text = option.filter_text();
+            let is_exact_match = Utf32Str::new(filter_text, &mut buf) == pattern.needle_text();
+            let match_length = filter_text.len() as u32;
+
             (
+                !is_exact_match,
+                match_length,
                 score <= min_score,
                 Reverse(option.preselect()),
                 option.provider_priority(),
@@ -573,7 +642,12 @@ impl Component for Completion {
 
         if cx.editor.popup_border() {
             use tui::widgets::{Block, Widget};
-            Widget::render(Block::bordered(), doc_area, surface);
+            let border_type = BorderType::new(cx.editor.config().rounded_corners);
+            Widget::render(
+                Block::bordered().border_type(border_type),
+                doc_area,
+                surface,
+            );
         }
 
         markdown_doc.render(doc_area, surface, cx);
@@ -661,4 +735,114 @@ fn completion_changes(transaction: &Transaction, trigger_offset: usize) -> Vec<C
         .changes_iter()
         .filter(|(start, end, _)| (*start..=*end).contains(&trigger_offset))
         .collect()
+}
+
+fn derive_color(base_color: Color, kind_name: &str) -> Color {
+    const HUE_SHIFT_AMOUNT: f32 = 0.15;
+    const SHIFT_RANGE: u32 = 15;
+    const SATURATION_BOOST: f32 = 0.05;
+    const LIGHTNESS_BOOST: f32 = 0.05;
+
+    if let Color::Rgb(r, g, b) = base_color {
+        let (mut h, mut s, mut l) = rgb_to_hsl(r, g, b);
+
+        // NOTE(Rok Kos): Generate a deterministic hash from the kind's name (e.g., "struct", "enum").
+        let hash = kind_name.as_bytes().iter().map(|&b| b as u32).sum::<u32>();
+
+        let shift: f32 =
+            ((hash % SHIFT_RANGE) as f32 - (SHIFT_RANGE / 2) as f32) * HUE_SHIFT_AMOUNT;
+        h = (h + shift).fract();
+        if h < 0.0 {
+            h += 1.0;
+        }
+
+        // NOTE(Rok Kos): Boost saturation and lightness to make it pop in the UI.
+        s = (s + SATURATION_BOOST).min(1.0);
+        l = (l + LIGHTNESS_BOOST).min(1.0);
+
+        let (new_r, new_g, new_b) = hsl_to_rgb(h, s, l);
+        Color::Rgb(new_r, new_g, new_b)
+    } else {
+        base_color
+    }
+}
+
+fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
+
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) / 2.0;
+    let mut h;
+    let s;
+
+    if max == min {
+        h = 0.0;
+        s = 0.0;
+    } else {
+        let d = max - min;
+        s = if l > 0.5 {
+            d / (2.0 - max - min)
+        } else {
+            d / (max + min)
+        };
+        h = match max {
+            x if x == r => (g - b) / d + (if g < b { 6.0 } else { 0.0 }),
+            x if x == g => (b - r) / d + 2.0,
+            _ => (r - g) / d + 4.0,
+        };
+        h /= 6.0;
+    }
+    (h, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let (r, g, b);
+
+    if s == 0.0 {
+        r = l;
+        g = l;
+        b = l;
+    } else {
+        let q = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let p = 2.0 * l - q;
+        r = hue_to_rgb(p, q, h + 1.0 / 3.0);
+        g = hue_to_rgb(p, q, h);
+        b = hue_to_rgb(p, q, h - 1.0 / 3.0);
+    }
+
+    (
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    )
+}
+
+fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
+    if t < 0.0 {
+        t += 1.0;
+    }
+    if t > 1.0 {
+        t -= 1.0;
+    }
+
+    const ONE_SIXTH: f32 = 1.0 / 6.0;
+    if t < ONE_SIXTH {
+        return p + (q - p) * 6.0 * t;
+    }
+    const ONE_HALF: f32 = 1.0 / 2.0;
+    if t < ONE_HALF {
+        return q;
+    }
+    const TWO_THIRDS: f32 = 2.0 / 3.0;
+    if t < TWO_THIRDS {
+        return p + (q - p) * (TWO_THIRDS - t) * 6.0;
+    }
+    p
 }

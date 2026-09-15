@@ -2712,6 +2712,7 @@ language-servers = [
 name = "hare"
 source = { git = "https://git.sr.ht/~ecs/tree-sitter-hare", rev = "07035a248943575444aa0b893ffe306e1444c0ab" }
 
+
 [[language]]
 name = "devicetree"
 scope = "source.devicetree"

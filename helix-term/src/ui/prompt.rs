@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::{borrow::Cow, ops::RangeFrom};
 use tui::buffer::Buffer as Surface;
 use tui::text::Span;
-use tui::widgets::{Block, Widget};
+use tui::widgets::{Block, BorderType, Widget};
 
 use helix_core::{
     unicode::segmentation::{GraphemeCursor, UnicodeSegmentation},
@@ -17,8 +17,9 @@ use helix_core::{
     Position,
 };
 use helix_view::{
+    editor::CmdlineStyle,
     graphics::{CursorKind, Margin, Rect},
-    Editor,
+    persistence, Editor,
 };
 
 type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
@@ -396,6 +397,95 @@ impl Prompt {
     pub fn exit_selection(&mut self) {
         self.selection = None;
     }
+
+    /// Get the current completions
+    pub fn completions(&self) -> &Vec<Completion> {
+        &self.completion
+    }
+
+    /// Get the current selection
+    pub fn selection(&self) -> Option<usize> {
+        self.selection
+    }
+
+    /// Get the language configuration
+    pub fn language(
+        &self,
+    ) -> &Option<(
+        &'static str,
+        std::sync::Arc<arc_swap::ArcSwap<helix_core::syntax::Loader>>,
+    )> {
+        &self.language
+    }
+
+    /// Get the prompt text
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// Get the current anchor position for horizontal scrolling
+    pub fn anchor(&self) -> usize {
+        self.anchor
+    }
+
+    /// Check if text is truncated at the start
+    pub fn truncate_start(&self) -> bool {
+        self.truncate_start
+    }
+
+    /// Check if text is truncated at the end
+    pub fn truncate_end(&self) -> bool {
+        self.truncate_end
+    }
+
+    /// Update the anchor position for horizontal scrolling based on cursor and available width.
+    /// This should be called before rendering when the popup needs to handle its own scrolling.
+    pub fn update_scroll_anchor(&mut self, line_width: usize) {
+        if self.line.width() < line_width {
+            self.anchor = 0;
+        } else if self.cursor <= self.anchor {
+            // Ensure the grapheme under the cursor is in view.
+            self.anchor = self.line[..self.cursor]
+                .grapheme_indices(true)
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or_default();
+        } else if self.line[self.anchor..self.cursor].width() > line_width {
+            // Set the anchor to the last grapheme cluster before the width is exceeded.
+            let mut width = 0;
+            self.anchor = self.line[..self.cursor]
+                .grapheme_indices(true)
+                .rev()
+                .find_map(|(idx, g)| {
+                    width += g.width();
+                    if width > line_width {
+                        Some(idx + g.len())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+        }
+
+        self.truncate_start = self.anchor > 0;
+        self.truncate_end = self.line[self.anchor..].width() > line_width;
+
+        // If we keep inserting characters just before the end ellipsis, move the anchor
+        // so that those new characters are displayed.
+        if self.truncate_end && self.line[self.anchor..self.cursor].width() >= line_width {
+            // Move the anchor forward by one non-zero-width grapheme.
+            self.anchor += self.line[self.anchor..]
+                .grapheme_indices(true)
+                .find_map(|(idx, g)| {
+                    if g.width() > 0 {
+                        Some(idx + g.len())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0);
+        }
+    }
 }
 
 const BASE_WIDTH: u16 = 30;
@@ -500,9 +590,11 @@ impl Prompt {
             let background = theme.get("ui.help");
             surface.clear_with(area, background);
 
+            let border_type = BorderType::new(cx.editor.config().rounded_corners);
             let block = Block::bordered()
                 // .title(self.title.as_str())
-                .border_style(background);
+                .border_style(background)
+                .border_type(border_type);
 
             let inner = block.inner(area).inner(Margin::horizontal(1));
 
@@ -513,12 +605,22 @@ impl Prompt {
         let line = area.height - 1;
         surface.clear_with(area.clip_top(line), background);
         // render buffer text
-        surface.set_string(area.x, area.y + line, &self.prompt, prompt_color);
+        // Map generic labels to traditional bottom-style symbols
+        let label = if cx.editor.config().cmdline.style == CmdlineStyle::Bottom {
+            if self.prompt == "Cmdline" {
+                ":"
+            } else if self.prompt == "Search" {
+                "/"
+            } else {
+                &self.prompt
+            }
+        } else {
+            &self.prompt
+        };
+        surface.set_string(area.x, area.y + line, label, prompt_color);
 
-        self.line_area = area
-            .clip_left(self.prompt.len() as u16)
-            .clip_top(line)
-            .clip_right(2);
+        let label_len = label.len() as u16;
+        self.line_area = area.clip_left(label_len).clip_top(line).clip_right(2);
 
         if self.line.is_empty() {
             self.anchor = 0;
@@ -697,6 +799,11 @@ impl Component for Prompt {
                                 {
                                     cx.editor.set_error(err.to_string());
                                 }
+                                if (cx.editor.config().persistence.commands && register == ':')
+                                    || (cx.editor.config().persistence.search && register == '/')
+                                {
+                                    persistence::push_reg_history(register, &self.line);
+                                }
                             };
                         }
 
@@ -770,9 +877,22 @@ impl Component for Prompt {
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
+        // Use the same label logic used in render_prompt so the cursor aligns with what is drawn.
+        // When using the traditional bottom cmdline, we draw ":" for Cmdline and "/" for Search.
+        let effective_label_len: u16 = if editor.config().cmdline.style == CmdlineStyle::Bottom {
+            if self.prompt == "Cmdline" || self.prompt == "Search" {
+                1
+            } else {
+                self.prompt.len() as u16
+            }
+        } else {
+            // Popup style renders no textual label inside the input area.
+            0
+        };
+
         let area = area
-            .clip_left(self.prompt.len() as u16)
-            .clip_right(if self.prompt.is_empty() { 2 } else { 0 });
+            .clip_left(effective_label_len)
+            .clip_right(if effective_label_len == 0 { 2 } else { 0 });
 
         let mut col = area.left() as usize + self.line[self.anchor..self.cursor].width();
 

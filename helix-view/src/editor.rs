@@ -9,14 +9,18 @@ use crate::{
     handlers::Handlers,
     info::Info,
     input::KeyEvent,
+    persistence::{self, FileHistoryEntry},
+    regex::EqRegex,
     register::Registers,
     theme::{self, Theme},
-    tree::{self, Tree},
+    tree::{self, Dimension, Resize, Tree},
+    view::ViewPosition,
     Document, DocumentId, View, ViewId,
 };
 use helix_event::dispatch;
 use helix_loader::workspace_trust::{ImplicitTrustLevel, TrustQuery, WorkspaceTrust};
 use helix_vcs::DiffProviderRegistry;
+use regex::Regex;
 
 use futures_util::stream::select_all::SelectAll;
 use futures_util::StreamExt;
@@ -65,6 +69,7 @@ use arc_swap::{
 
 pub const DIR_STACK_CAP: usize = 10;
 pub const DEFAULT_AUTO_SAVE_DELAY: u64 = 3000;
+pub const DEFAULT_AUTO_RELOAD_INTERVAL: u64 = 3000;
 
 fn deserialize_duration_millis<'de, D>(deserializer: D) -> Result<Duration, D::Error>
 where
@@ -176,6 +181,40 @@ impl Default for GutterLineNumbersConfig {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InlineBlameShow {
+    /// Do not show inline blame, and do not request it in the background
+    ///
+    /// When manually requesting the inline blame, it may take several seconds to appear.
+    Never,
+    /// Show the inline blame on the cursor line
+    CursorLine,
+    /// Show the inline blame on every other line
+    AllLines,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct InlineBlameConfig {
+    /// How to show the inline blame
+    pub show: InlineBlameShow,
+    /// Whether the inline blame should be fetched in the background
+    pub auto_fetch: bool,
+    /// How the inline blame should look like and the information it includes
+    pub format: String,
+}
+
+impl Default for InlineBlameConfig {
+    fn default() -> Self {
+        Self {
+            show: InlineBlameShow::Never,
+            format: "{author}, {time-ago} • {title} • {commit}".to_owned(),
+            auto_fetch: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct FilePickerConfig {
@@ -205,6 +244,8 @@ pub struct FilePickerConfig {
     /// WalkBuilder options
     /// Maximum Depth to recurse directories in file picker and global search. Defaults to `None`.
     pub max_depth: Option<usize>,
+    /// Whether to hide the preview panel. Defaults to false.
+    pub hide_preview: bool,
 }
 
 impl Default for FilePickerConfig {
@@ -219,6 +260,7 @@ impl Default for FilePickerConfig {
             git_global: true,
             git_exclude: true,
             max_depth: None,
+            hide_preview: false,
         }
     }
 }
@@ -291,11 +333,51 @@ where
     Ok(chars)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct ScrolloffConfig {
+    pub horizontal: usize,
+    pub vertical: usize,
+}
+
+fn deserialize_scrolloff_config<'de, D>(deserializer: D) -> Result<ScrolloffConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum ScrolloffConfigDe {
+        Legacy(usize),
+        Split(ScrolloffConfig),
+    }
+
+    let scrolloff = ScrolloffConfigDe::deserialize(deserializer)?;
+    match scrolloff {
+        ScrolloffConfigDe::Legacy(u) => Ok(ScrolloffConfig {
+            horizontal: u,
+            vertical: u,
+        }),
+        ScrolloffConfigDe::Split(s) => Ok(s),
+    }
+}
+
+impl Default for ScrolloffConfig {
+    fn default() -> Self {
+        Self {
+            horizontal: 5,
+            vertical: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
+    /// Whether to enable the welcome screen
+    pub welcome_screen: bool,
     /// Padding to keep between the edge of the screen and the cursor when scrolling. Defaults to 5.
-    pub scrolloff: usize,
+    #[serde(deserialize_with = "deserialize_scrolloff_config")]
+    pub scrolloff: ScrolloffConfig,
     /// Number of lines to scroll at once. Defaults to 3
     pub scroll_lines: isize,
     /// Mouse support. Defaults to true.
@@ -306,6 +388,8 @@ pub struct Config {
     pub shell: Vec<String>,
     /// Line number mode.
     pub line_number: LineNumber,
+    /// Symbol to use for the picker. Defaults to ">".
+    pub picker_symbol: String,
     /// Highlight the lines cursors are currently on. Defaults to false.
     pub cursorline: bool,
     /// Highlight the columns cursors are currently on. Defaults to false.
@@ -337,6 +421,10 @@ pub struct Config {
     /// Time delay defaults to false with 3000ms delay. Focus lost defaults to false.
     #[serde(deserialize_with = "deserialize_auto_save")]
     pub auto_save: AutoSave,
+    /// Automatic reload of the modified documents on a periodic time interval and/or when the editor gains focus.
+    /// Time interval defaults to false with 3000ms delay. Focus gained defaults to false.
+    #[serde(deserialize_with = "deserialize_auto_reload")]
+    pub auto_reload: AutoReload,
     /// Set a global text_width
     pub text_width: usize,
     /// Time in milliseconds since last keypress before idle timers trigger.
@@ -365,6 +453,11 @@ pub struct Config {
     /// Whether to display infoboxes. Defaults to true.
     pub auto_info: bool,
     pub file_picker: FilePickerConfig,
+    /// Configuration of the bufferline
+    pub bufferline: BufferLineConfig,
+    /// Persistently display a breadcrumb navigation bar along the top of each view
+    pub breadcrumb: BreadcrumbConfig,
+    /// Configuration of the file explorer
     pub file_explorer: FileExplorerConfig,
     /// Configuration of the statusline elements
     pub statusline: StatusLineConfig,
@@ -381,10 +474,11 @@ pub struct Config {
     pub terminal: Option<TerminalConfig>,
     /// Column numbers at which to draw the rulers. Defaults to `[]`, meaning no rulers.
     pub rulers: Vec<u16>,
+    /// Character used to render rulers in the foreground. Defaults to "" (background-style rulers).
+    /// Set to empty string "" to use background-style rulers instead of a glyph.
+    pub ruler_char: String,
     #[serde(default)]
     pub whitespace: WhitespaceConfig,
-    /// Persistently display open buffers along the top
-    pub bufferline: BufferLine,
     /// Vertical indent width guides.
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
@@ -410,6 +504,8 @@ pub struct Config {
     pub smart_tab: Option<SmartTabConfig>,
     /// Draw border around popups.
     pub popup_border: PopupBorderConfig,
+    /// Draw rounded border corners
+    pub rounded_corners: bool,
     /// Which indent heuristic to use when a new line is inserted
     #[serde(default)]
     pub indent_heuristic: IndentationHeuristic,
@@ -427,13 +523,46 @@ pub struct Config {
     /// Whether to read settings from [EditorConfig](https://editorconfig.org) files. Defaults to
     /// `true`.
     pub editor_config: bool,
+    /// Maximum width for panel resizing. Set to 0 for dynamic limit based on terminal width. Defaults to 50.
+    pub max_panel_width: usize,
+    /// Maximum height for panel resizing. Set to 0 for dynamic limit based on terminal height. Defaults to 50.
+    pub max_panel_height: usize,
+    /// Maximum panel width as percentage of terminal width (0.0-1.0). Used when max_panel_width is 0. Defaults to 0.8.
+    pub max_panel_width_percent: f32,
+    /// Maximum panel height as percentage of terminal height (0.0-1.0). Used when max_panel_height is 0. Defaults to 0.8.
+    pub max_panel_height_percent: f32,
+    /// Inline blame allows showing the latest commit that affected the line the cursor is on as virtual text
+    #[serde(default)]
+    pub inline_blame: InlineBlameConfig,
     /// Whether to render rainbow colors for matching brackets. Defaults to `false`.
     pub rainbow_brackets: bool,
     /// Whether to enable Kitty Keyboard Protocol
     pub kitty_keyboard_protocol: KittyKeyboardProtocolConfig,
+    /// Command line configuration
+    #[serde(default)]
+    pub cmdline: CmdlineConfig,
+    /// Picker gradient border configuration
+    #[serde(default)]
+    pub gradient_borders: GradientBorderConfig,
+    /// Whether to show pickers in fullscreen mode. When true, pickers expand to
+    /// full screen width on terminals narrower than 200 columns. Defaults to false.
+    pub fullscreen_overlay: bool,
+    /// Notification system configuration
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    /// Completion Highlight configuration
+    #[serde(default)]
+    pub completion_highlight: CompletionHighlight,
     pub buffer_picker: BufferPickerConfig,
+    /// Defines which text objects will be folded when a document is opened.
+    #[serde(default)]
+    pub fold_textobjects: Vec<String>,
+    /// Whether to implicitly trust every workspace or not
+    pub insecure: bool,
     /// Workspace-trust configuration.
     pub workspace_trust: WorkspaceTrustConfig,
+    /// Cross-session persistence of command/search history, clipboard, and file positions.
+    pub persistence: PersistenceConfig,
 }
 
 /// User-facing configuration for `[editor.workspace-trust]`.
@@ -548,6 +677,319 @@ pub enum KittyKeyboardProtocolConfig {
     Enabled,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct CmdlineConfig {
+    /// Command line display style. Options: "bottom", "popup". Defaults to "bottom".
+    pub style: CmdlineStyle,
+    /// Enable command icons in cmdline. Defaults to true.
+    pub show_icons: bool,
+    /// Minimum width for popup cmdline. Defaults to 40.
+    pub min_popup_width: u16,
+    /// Maximum width for popup cmdline. Defaults to 80.
+    pub max_popup_width: u16,
+    /// Use full height when cmdline style is popup (removes the bottom space). Defaults to false.
+    pub use_full_height: bool,
+    /// Customizable icons for different command types.
+    pub icons: CmdlineIcons,
+}
+
+impl Default for CmdlineConfig {
+    fn default() -> Self {
+        Self {
+            style: CmdlineStyle::Bottom,
+            show_icons: true,
+            min_popup_width: 40,
+            max_popup_width: 80,
+            use_full_height: false,
+            icons: CmdlineIcons::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct CmdlineIcons {
+    /// Icon for search commands (/,?). Defaults to "🔍".
+    pub search: String,
+    /// Icon for command mode (:). Defaults to "⚙".
+    pub command: String,
+    /// Icon for shell commands (!). Defaults to "⚡".
+    pub shell: String,
+    /// Icon for general prompts. Defaults to "💬".
+    pub general: String,
+}
+
+impl Default for CmdlineIcons {
+    fn default() -> Self {
+        Self {
+            search: "🔍".to_string(),
+            command: "🛠️".to_string(),
+            shell: "⚡".to_string(),
+            general: "💬".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CmdlineStyle {
+    /// Traditional bottom command line
+    #[default]
+    Bottom,
+    /// Centered popup window (noice.nvim style)
+    Popup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct GradientBorderConfig {
+    /// Enable gradient borders for pickers. Defaults to false.
+    pub enable: bool,
+    /// Border thickness (1-5). Defaults to 1.
+    pub thickness: u8,
+    /// Gradient direction. Options: "horizontal", "vertical", "diagonal". Defaults to "horizontal".
+    pub direction: GradientDirection,
+    /// Start color (in hex format like "#FF0000"). Defaults to "#8A2BE2".
+    pub start_color: String,
+    /// End color (in hex format like "#FF0000"). Defaults to "#00BFFF".
+    pub end_color: String,
+    /// Middle color for 3-color gradients (optional). Defaults to "".
+    pub middle_color: String,
+    /// Animation speed (0-10, 0 = disabled). Defaults to 0.
+    pub animation_speed: u8,
+}
+
+impl Default for GradientBorderConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            thickness: 1,
+            direction: GradientDirection::Horizontal,
+            start_color: "#8A2BE2".to_string(), // BlueViolet
+            end_color: "#00BFFF".to_string(),   // DeepSkyBlue
+            middle_color: "".to_string(),
+            animation_speed: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GradientDirection {
+    /// Left to right gradient
+    #[default]
+    Horizontal,
+    /// Top to bottom gradient
+    Vertical,
+    /// Diagonal gradient (top-left to bottom-right)
+    Diagonal,
+    /// Radial gradient from center
+    Radial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NotificationConfig {
+    /// Enable notification system. Defaults to true.
+    pub enable: bool,
+    /// Notification display style. Options: "popup", "statusline". Defaults to "popup".
+    pub style: NotificationStyle,
+    /// Maximum number of notifications to keep in history. Defaults to 100.
+    pub max_history: usize,
+    /// Default timeout for notifications in milliseconds. 0 = no timeout. Defaults to 5000.
+    #[serde(
+        serialize_with = "serialize_duration_millis",
+        deserialize_with = "deserialize_duration_millis"
+    )]
+    pub default_timeout: Duration,
+    /// Position for popup notifications. Defaults to "top-right".
+    pub position: NotificationPosition,
+    /// Maximum width for notification popups. Defaults to 60.
+    pub max_width: u16,
+    /// Maximum height for notification popups. Defaults to 10.
+    pub max_height: u16,
+    /// Show notification icons. Defaults to true.
+    pub show_icons: bool,
+    /// Notification icons for different severity levels.
+    pub icons: NotificationIcons,
+    /// Padding inside the notification content area
+    pub padding: u16,
+    /// Show notification emojis. Defaults to true.
+    pub show_emojis: bool,
+    /// Notification emojis for different severity levels.
+    pub emojis: NotificationEmojis,
+    /// Enable notification history command. Defaults to true.
+    pub enable_history: bool,
+    /// Border configuration for notifications.
+    pub border: NotificationBorderConfig,
+    /// Drop shadow configuration for notifications
+    pub shadow: NotificationShadowConfig,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            style: NotificationStyle::Popup,
+            max_history: 100,
+            default_timeout: Duration::from_millis(5000),
+            position: NotificationPosition::TopRight,
+            max_width: 60,
+            max_height: 10,
+            show_icons: true,
+            icons: NotificationIcons::default(),
+            padding: 1,
+            show_emojis: true,
+            emojis: NotificationEmojis::default(),
+            enable_history: true,
+            border: NotificationBorderConfig::default(),
+            shadow: NotificationShadowConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationStyle {
+    /// Show notifications as popup windows (noice.nvim style)
+    #[default]
+    Popup,
+    /// Show notifications in statusline (traditional style)
+    Statusline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationPosition {
+    /// Top-left corner
+    TopLeft,
+    /// Top-center
+    TopCenter,
+    /// Top-right corner
+    #[default]
+    TopRight,
+    /// Bottom-left corner
+    BottomLeft,
+    /// Bottom-center
+    BottomCenter,
+    /// Bottom-right corner
+    BottomRight,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NotificationIcons {
+    /// Icon for info notifications. Defaults to "ℹ".
+    pub info: String,
+    /// Icon for warning notifications. Defaults to "⚠".
+    pub warning: String,
+    /// Icon for error notifications. Defaults to "✗".
+    pub error: String,
+    /// Icon for success notifications. Defaults to "✓".
+    pub success: String,
+}
+
+impl Default for NotificationIcons {
+    fn default() -> Self {
+        Self {
+            info: "ℹ".to_string(),
+            warning: "⚠".to_string(),
+            error: "✗".to_string(),
+            success: "✓".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NotificationEmojis {
+    /// Emoji for info notifications. Defaults to "💡".
+    pub info: String,
+    /// Emoji for warning notifications. Defaults to "⚠️".
+    pub warning: String,
+    /// Emoji for error notifications. Defaults to "❌".
+    pub error: String,
+    /// Emoji for success notifications. Defaults to "✅".
+    pub success: String,
+}
+
+impl Default for NotificationEmojis {
+    fn default() -> Self {
+        Self {
+            info: "💡".to_string(),
+            warning: "⚠️".to_string(),
+            error: "❌".to_string(),
+            success: "✅".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NotificationBorderConfig {
+    /// Enable borders for notifications. Defaults to true.
+    pub enable: bool,
+    /// Border width (1-5). Defaults to 1.
+    pub width: u8,
+    /// Border radius for rounded corners (0-10). Defaults to 2.
+    pub radius: u8,
+    /// Use gradient borders. Defaults to false.
+    pub gradient: bool,
+    /// Gradient start color (in hex format like "#FF0000"). Defaults to "#8A2BE2".
+    pub gradient_start: String,
+    /// Gradient end color (in hex format like "#FF0000"). Defaults to "#00BFFF".
+    pub gradient_end: String,
+    /// Border style. Options: "solid", "dashed", "dotted". Defaults to "solid".
+    pub style: NotificationBorderStyle,
+}
+
+impl Default for NotificationBorderConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            width: 1,
+            radius: 2,
+            gradient: false,
+            gradient_start: "#8A2BE2".to_string(), // BlueViolet
+            gradient_end: "#00BFFF".to_string(),   // DeepSkyBlue
+            style: NotificationBorderStyle::Solid,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotificationBorderStyle {
+    /// Solid border
+    #[default]
+    Solid,
+    /// Dashed border
+    Dashed,
+    /// Dotted border
+    Dotted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct NotificationShadowConfig {
+    /// Enable drop shadow
+    pub enable: bool,
+    /// Shadow offset on x and y axes
+    pub offset_x: u16,
+    pub offset_y: u16,
+}
+
+impl Default for NotificationShadowConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            offset_x: 1,
+            offset_y: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, Eq, PartialOrd, Ord)]
 #[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SmartTabConfig {
@@ -630,6 +1072,8 @@ pub struct LspConfig {
     pub auto_signature_help: bool,
     /// Display docs under signature help popup
     pub display_signature_help_docs: bool,
+    /// Position of signature help popup relative to cursor: "above" or "below"
+    pub signature_help_position: SignatureHelpPosition,
     /// Display inlay hints
     pub display_inlay_hints: bool,
     /// Automatically highlight symbol references at the cursor.
@@ -639,6 +1083,8 @@ pub struct LspConfig {
     pub inlay_hints_length_limit: Option<NonZeroU8>,
     /// Display document color swatches
     pub display_color_swatches: bool,
+    /// Color swatches string. Defaults to `"■"`.
+    pub color_swatches_string: String,
     /// Whether to enable snippet support
     pub snippets: bool,
     /// Whether to include declaration in the goto reference query
@@ -653,14 +1099,23 @@ impl Default for LspConfig {
             display_messages: true,
             auto_signature_help: true,
             display_signature_help_docs: true,
+            signature_help_position: SignatureHelpPosition::Above,
             display_inlay_hints: false,
             auto_document_highlight: false,
             inlay_hints_length_limit: None,
             snippets: true,
             goto_reference_include_declaration: true,
             display_color_swatches: true,
+            color_swatches_string: "■".to_owned(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SignatureHelpPosition {
+    Above,
+    Below,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -670,6 +1125,72 @@ pub struct SearchConfig {
     pub smart_case: bool,
     /// Whether the search should wrap after depleting the matches. Default to true.
     pub wrap_around: bool,
+}
+
+/// bufferline render modes
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BufferLineRenderMode {
+    /// Don't render bufferline
+    #[default]
+    Never,
+    /// Always render
+    Always,
+    /// Only if multiple buffers are open
+    Multiple,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct BufferLineConfig {
+    pub render_mode: BufferLineRenderMode,
+    pub separator: String,
+}
+
+impl Default for BufferLineConfig {
+    fn default() -> Self {
+        Self {
+            render_mode: BufferLineRenderMode::default(),
+            separator: String::from("│"),
+        }
+    }
+}
+
+/// How much path information is shown in the breadcrumb bar
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BreadcrumbPathOptions {
+    /// Show the full relative path before the symbols
+    #[default]
+    Full,
+    /// Show only the file name
+    File,
+    /// Show no path information
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct BreadcrumbConfig {
+    pub enable: bool,
+    pub path: BreadcrumbPathOptions,
+    /// Maximum number of symbol levels shown; when exceeded the outermost
+    /// symbols are elided with `…`. `0` means unlimited.
+    pub max_depth: usize,
+    /// Maximum length of a single crumb name; longer names are truncated in
+    /// the middle with `…`. `0` means unlimited.
+    pub max_name_length: usize,
+}
+
+impl Default for BreadcrumbConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            path: BreadcrumbPathOptions::Full,
+            max_depth: 8,
+            max_name_length: 32,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -802,6 +1323,8 @@ pub enum StatusLineElement {
     /// The base of current working directory
     CurrentWorkingDirectory,
 
+    /// The current function name (from tree-sitter)
+    FunctionName,
     /// Indicator for when code actions are available
     CodeActionHint,
 }
@@ -858,19 +1381,6 @@ impl Default for CursorShapeConfig {
     fn default() -> Self {
         Self([CursorKind::Block; 3])
     }
-}
-
-/// bufferline render modes
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum BufferLine {
-    /// Don't render bufferline
-    #[default]
-    Never,
-    /// Always render
-    Always,
-    /// Only if multiple buffers are open
-    Multiple,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,6 +1575,52 @@ where
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutoReload {
+    /// Whether to check for file changes when the editor is focused. Defaults to false.
+    #[serde(default)]
+    pub focus_gained: bool,
+    /// Autosave periodically at some interval. Defaults to disabled.
+    #[serde(default)]
+    pub periodic: AutoReloadPeriodic,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoReloadPeriodic {
+    #[serde(default)]
+    /// Enable auto reload periodically. Defaults to false.
+    pub enable: bool,
+    #[serde(default = "default_auto_reload_interval")]
+    /// Time interval in milliseconds. Defaults to [DEFAULT_AUTO_RELOAD_INTERVAL].
+    pub interval: u64,
+}
+
+pub fn default_auto_reload_interval() -> u64 {
+    DEFAULT_AUTO_RELOAD_INTERVAL
+}
+
+fn deserialize_auto_reload<'de, D>(deserializer: D) -> Result<AutoReload, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize, Serialize)]
+    #[serde(untagged, deny_unknown_fields, rename_all = "kebab-case")]
+    enum AutoReloadToml {
+        FocusGained(bool),
+        AutoReload(AutoReload),
+    }
+
+    match AutoReloadToml::deserialize(deserializer)? {
+        AutoReloadToml::FocusGained(focus_gained) => Ok(AutoReload {
+            focus_gained,
+            ..Default::default()
+        }),
+        AutoReloadToml::AutoReload(auto_reload) => Ok(auto_reload),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhitespaceCharacters {
@@ -1172,10 +1728,66 @@ impl Default for WordCompletion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompletionHighlightType {
+    Default,
+    ThemeColors,
+    Vibrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct CompletionHighlight {
+    /// What kind of highlight type: "default", "theme-colors", "vibrant"
+    pub highlight_type: CompletionHighlightType,
+}
+
+impl Default for CompletionHighlight {
+    fn default() -> Self {
+        Self {
+            highlight_type: CompletionHighlightType::Default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+pub struct PersistenceConfig {
+    pub old_files: bool,
+    pub commands: bool,
+    pub search: bool,
+    pub clipboard: bool,
+    pub old_files_exclusions: Vec<EqRegex>,
+    pub old_files_trim: usize,
+    pub commands_trim: usize,
+    pub search_trim: usize,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            old_files: false,
+            commands: false,
+            search: false,
+            clipboard: false,
+            // TODO: any more defaults we should add here?
+            old_files_exclusions: [r".*/\.git/.*", r".*/COMMIT_EDITMSG"]
+                .iter()
+                .map(|s| Regex::new(s).unwrap().into())
+                .collect(),
+            old_files_trim: 100,
+            commands_trim: 100,
+            search_trim: 100,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            scrolloff: 5,
+            welcome_screen: true,
+            scrolloff: ScrolloffConfig::default(),
             scroll_lines: 3,
             mouse: true,
             mouse_yank_register: '*',
@@ -1185,6 +1797,7 @@ impl Default for Config {
                 vec!["sh".to_owned(), "-c".to_owned()]
             },
             line_number: LineNumber::Absolute,
+            picker_symbol: ">".to_string(),
             cursorline: false,
             cursorcolumn: false,
             gutters: GutterConfig::default(),
@@ -1196,12 +1809,15 @@ impl Default for Config {
             auto_format: true,
             default_yank_register: '"',
             auto_save: AutoSave::default(),
+            auto_reload: AutoReload::default(),
             idle_timeout: Duration::from_millis(250),
             completion_timeout: Duration::from_millis(250),
             preview_completion_insert: true,
             completion_trigger_len: 2,
             auto_info: true,
             file_picker: FilePickerConfig::default(),
+            bufferline: BufferLineConfig::default(),
+            breadcrumb: BreadcrumbConfig::default(),
             file_explorer: FileExplorerConfig::default(),
             statusline: StatusLineConfig::default(),
             cursor_shape: CursorShapeConfig::default(),
@@ -1211,8 +1827,8 @@ impl Default for Config {
             lsp: LspConfig::default(),
             terminal: get_terminal_provider(),
             rulers: Vec::new(),
+            ruler_char: "".to_string(),
             whitespace: WhitespaceConfig::default(),
-            bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
             soft_wrap: SoftWrap {
@@ -1230,16 +1846,30 @@ impl Default for Config {
             trim_trailing_whitespace: false,
             smart_tab: Some(SmartTabConfig::default()),
             popup_border: PopupBorderConfig::None,
+            rounded_corners: false,
             indent_heuristic: IndentationHeuristic::default(),
             jump_label_alphabet: ('a'..='z').collect(),
             inline_diagnostics: InlineDiagnosticsConfig::default(),
             end_of_line_diagnostics: DiagnosticFilter::Enable(Severity::Hint),
             clipboard_provider: ClipboardProvider::default(),
+            inline_blame: InlineBlameConfig::default(),
             editor_config: true,
+            max_panel_width: 50,
+            max_panel_height: 50,
+            max_panel_width_percent: 0.8,
+            max_panel_height_percent: 0.8,
             rainbow_brackets: false,
             kitty_keyboard_protocol: Default::default(),
+            cmdline: CmdlineConfig::default(),
+            gradient_borders: GradientBorderConfig::default(),
+            notifications: NotificationConfig::default(),
+            completion_highlight: CompletionHighlight::default(),
+            fullscreen_overlay: false,
             buffer_picker: BufferPickerConfig::default(),
+            fold_textobjects: Vec::new(),
+            insecure: false,
             workspace_trust: WorkspaceTrustConfig::default(),
+            persistence: PersistenceConfig::default(),
         }
     }
 }
@@ -1269,6 +1899,136 @@ pub struct Breakpoint {
 use futures_util::stream::{Flatten, Once};
 
 type Diagnostics = BTreeMap<Uri, Vec<(lsp::Diagnostic, DiagnosticProvider)>>;
+
+#[derive(Debug, Clone)]
+pub struct Notification {
+    pub id: usize,
+    pub message: Cow<'static, str>,
+    pub severity: Severity,
+    pub timestamp: Instant,
+    pub timeout: Option<Duration>,
+    pub dismissed: bool,
+    /// Optional corner radius override for this notification
+    pub corner_radius: Option<u8>,
+}
+
+impl Notification {
+    pub fn new(message: impl Into<Cow<'static, str>>, severity: Severity) -> Self {
+        Self {
+            id: 0, // Will be set by NotificationManager
+            message: message.into(),
+            severity,
+            timestamp: Instant::now(),
+            timeout: None,
+            dismissed: false,
+            corner_radius: None,
+        }
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn is_expired(&self) -> bool {
+        if let Some(timeout) = self.timeout {
+            let elapsed = self.timestamp.elapsed();
+            let expired = elapsed >= timeout;
+            if expired {
+                log::warn!(
+                    "Notification {} expired: elapsed={:?}, timeout={:?}",
+                    self.id,
+                    elapsed,
+                    timeout
+                );
+            }
+            expired
+        } else {
+            false
+        }
+    }
+
+    pub fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct NotificationManager {
+    notifications: Vec<Notification>,
+    next_id: usize,
+    max_history: usize,
+}
+
+impl NotificationManager {
+    pub fn new(max_history: usize) -> Self {
+        Self {
+            notifications: Vec::new(),
+            next_id: 1,
+            max_history,
+        }
+    }
+
+    pub fn add(&mut self, mut notification: Notification) -> usize {
+        // Deduplicate: if an active notification with the same message and
+        // severity already exists, refresh its timestamp and return its id.
+        if let Some(existing) = self.notifications.iter_mut().find(|n| {
+            n.message == notification.message
+                && n.severity == notification.severity
+                && !n.dismissed
+                && !n.is_expired()
+        }) {
+            existing.timestamp = Instant::now();
+            return existing.id;
+        }
+
+        notification.id = self.next_id;
+        self.next_id += 1;
+
+        let id = notification.id; // Store the ID before moving
+        self.notifications.push(notification);
+
+        // Clean up old notifications if we exceed max_history
+        if self.notifications.len() > self.max_history {
+            let excess = self.notifications.len() - self.max_history;
+            self.notifications.drain(0..excess);
+        }
+
+        id
+    }
+
+    pub fn dismiss(&mut self, id: usize) {
+        if let Some(notification) = self.notifications.iter_mut().find(|n| n.id == id) {
+            notification.dismiss();
+        }
+    }
+
+    pub fn dismiss_all(&mut self) {
+        for notification in &mut self.notifications {
+            notification.dismiss();
+        }
+    }
+
+    pub fn get_active(&self) -> Vec<&Notification> {
+        self.notifications
+            .iter()
+            .filter(|n| !n.dismissed && !n.is_expired())
+            .collect()
+    }
+
+    pub fn get_all(&self) -> &[Notification] {
+        &self.notifications
+    }
+
+    pub fn cleanup_expired(&mut self) {
+        self.notifications
+            .retain(|n| !n.is_expired() && !n.dismissed);
+    }
+
+    pub fn clear_history(&mut self) {
+        self.notifications.clear();
+    }
+}
 
 pub struct Editor {
     /// Current editing mode.
@@ -1310,6 +2070,7 @@ pub struct Editor {
     pub last_selection: Option<Selection>,
 
     pub status_msg: Option<(Cow<'static, str>, Severity)>,
+    pub notifications: NotificationManager,
     pub autoinfo: Option<Info>,
 
     pub config: Arc<dyn DynAccess<Config>>,
@@ -1343,6 +2104,8 @@ pub struct Editor {
     pub mouse_down_range: Option<Range>,
     pub cursor_cache: CursorCache,
     pub workspace_trust: WorkspaceTrust,
+    /// File positions restored from / written to persistent state.
+    pub old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
 }
 
 pub type Motion = Box<dyn Fn(&mut Editor)>;
@@ -1417,6 +2180,7 @@ impl Editor {
         config: Arc<dyn DynAccess<Config>>,
         handlers: Handlers,
         workspace_trust: WorkspaceTrust,
+        old_file_locs: HashMap<PathBuf, (ViewPosition, Selection)>,
     ) -> Self {
         let language_servers = helix_lsp::Registry::new(syn_loader.clone());
         let conf = config.load();
@@ -1452,6 +2216,7 @@ impl Editor {
                 |config: &Config| &config.clipboard_provider,
             ))),
             status_msg: None,
+            notifications: NotificationManager::new(conf.notifications.max_history),
             autoinfo: None,
             idle_timer: Box::pin(sleep(conf.idle_timeout)),
             redraw_timer: Box::pin(sleep(Duration::MAX)),
@@ -1468,6 +2233,7 @@ impl Editor {
             cursor_cache: CursorCache::default(),
             dir_stack: VecDeque::with_capacity(DIR_STACK_CAP),
             workspace_trust,
+            old_file_locs,
         }
     }
 
@@ -1529,45 +2295,208 @@ impl Editor {
         self.idle_timer
             .as_mut()
             .reset(Instant::now() + config.idle_timeout);
+
+        // Cleanup expired notifications periodically
+        self.cleanup_notifications();
     }
 
     pub fn clear_status(&mut self) {
         self.status_msg = None;
+        self.notifications.dismiss_all();
     }
 
     #[inline]
     pub fn set_status<T: Into<Cow<'static, str>>>(&mut self, status: T) {
         let status = status.into();
         log::debug!("editor status: {}", status);
-        self.status_msg = Some((status, Severity::Info));
+
+        let config = self.config();
+        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
+            // Only create notification, don't set status_msg for popup style
+            self.notify_info(status);
+        } else {
+            // Traditional behavior: set status_msg and optionally create notification
+            self.status_msg = Some((status.clone(), Severity::Info));
+            if config.notifications.enable {
+                self.notify_info(status);
+            }
+        }
     }
 
     #[inline]
     pub fn set_error<T: Into<Cow<'static, str>>>(&mut self, error: T) {
         let error = error.into();
         log::debug!("editor error: {}", error);
-        self.status_msg = Some((error, Severity::Error));
+
+        let config = self.config();
+        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
+            // Only create notification, don't set status_msg for popup style
+            self.notify_error(error);
+        } else {
+            // Traditional behavior: set status_msg and optionally create notification
+            self.status_msg = Some((error.clone(), Severity::Error));
+            if config.notifications.enable {
+                self.notify_error(error);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn set_result<T: Into<Cow<'static, str>>>(&mut self, result: Result<T, T>) {
+        match result {
+            Ok(ok) => self.set_status(ok),
+            Err(err) => self.set_error(err),
+        }
     }
 
     #[inline]
     pub fn set_warning<T: Into<Cow<'static, str>>>(&mut self, warning: T) {
         let warning = warning.into();
         log::warn!("editor warning: {}", warning);
-        self.status_msg = Some((warning, Severity::Warning));
+
+        let config = self.config();
+        if config.notifications.enable && config.notifications.style == NotificationStyle::Popup {
+            // Only create notification, don't set status_msg for popup style
+            self.notify_warning(warning);
+        } else {
+            // Traditional behavior: set status_msg and optionally create notification
+            self.status_msg = Some((warning.clone(), Severity::Warning));
+            if config.notifications.enable {
+                self.notify_warning(warning);
+            }
+        }
     }
 
     #[inline]
     pub fn get_status(&self) -> Option<(&Cow<'static, str>, &Severity)> {
-        self.status_msg.as_ref().map(|(status, sev)| (status, sev))
+        self.status_msg
+            .as_ref()
+            .map(|(status, sev)| (status, sev))
+            .or_else(|| {
+                self.notifications
+                    .get_active()
+                    .last()
+                    .map(|n| (&n.message, &n.severity))
+            })
     }
 
     /// Returns true if the current status is an error
     #[inline]
     pub fn is_err(&self) -> bool {
-        self.status_msg
-            .as_ref()
+        self.get_status()
             .map(|(_, sev)| *sev == Severity::Error)
             .unwrap_or(false)
+    }
+
+    // Notification methods
+    pub fn notify<T: Into<Cow<'static, str>>>(&mut self, message: T) -> usize {
+        self.notify_with_severity(message, Severity::Info)
+    }
+
+    pub fn notify_info<T: Into<Cow<'static, str>>>(&mut self, message: T) -> usize {
+        self.notify_with_severity(message, Severity::Info)
+    }
+
+    pub fn notify_warning<T: Into<Cow<'static, str>>>(&mut self, message: T) -> usize {
+        self.notify_with_severity(message, Severity::Warning)
+    }
+
+    pub fn notify_error<T: Into<Cow<'static, str>>>(&mut self, message: T) -> usize {
+        self.notify_with_severity(message, Severity::Error)
+    }
+
+    pub fn notify_with_severity<T: Into<Cow<'static, str>>>(
+        &mut self,
+        message: T,
+        severity: Severity,
+    ) -> usize {
+        let config = self.config();
+        if !config.notifications.enable {
+            // Fall back to traditional status messages if notifications are disabled
+            match severity {
+                Severity::Error => self.set_error(message),
+                Severity::Warning => self.set_warning(message),
+                _ => self.set_status(message),
+            }
+            return 0;
+        }
+
+        let mut notification = Notification::new(message, severity);
+
+        // Set default timeout if configured
+        if config.notifications.default_timeout > Duration::ZERO {
+            let timeout = config.notifications.default_timeout;
+            notification = notification.with_timeout(timeout);
+            // Schedule a redraw at the timeout moment so the UI can expire/fade it immediately
+            tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                helix_event::request_redraw();
+            });
+        }
+
+        let id = self.notifications.add(notification);
+
+        // Also set status message for compatibility if using statusline style
+        if config.notifications.style == NotificationStyle::Statusline {
+            match severity {
+                Severity::Error => {
+                    let msg = self
+                        .notifications
+                        .notifications
+                        .last()
+                        .unwrap()
+                        .message
+                        .clone();
+                    self.status_msg = Some((msg, Severity::Error));
+                }
+                Severity::Warning => {
+                    let msg = self
+                        .notifications
+                        .notifications
+                        .last()
+                        .unwrap()
+                        .message
+                        .clone();
+                    self.status_msg = Some((msg, Severity::Warning));
+                }
+                _ => {
+                    let msg = self
+                        .notifications
+                        .notifications
+                        .last()
+                        .unwrap()
+                        .message
+                        .clone();
+                    self.status_msg = Some((msg, Severity::Info));
+                }
+            }
+        }
+
+        id
+    }
+
+    pub fn dismiss_notification(&mut self, id: usize) {
+        self.notifications.dismiss(id);
+    }
+
+    pub fn dismiss_all_notifications(&mut self) {
+        self.notifications.dismiss_all();
+    }
+
+    pub fn get_active_notifications(&self) -> Vec<&Notification> {
+        self.notifications.get_active()
+    }
+
+    pub fn get_notification_history(&self) -> &[Notification] {
+        self.notifications.get_all()
+    }
+
+    pub fn clear_notification_history(&mut self) {
+        self.notifications.clear_history();
+    }
+
+    pub fn cleanup_notifications(&mut self) {
+        self.notifications.cleanup_expired();
     }
 
     pub fn unset_theme_preview(&mut self) -> anyhow::Result<()> {
@@ -2061,7 +2990,7 @@ impl Editor {
         id
     }
 
-    fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
+    pub fn new_file_from_document(&mut self, action: Action, doc: Document) -> DocumentId {
         let id = self.new_document(doc);
         self.switch(id, action);
         id
@@ -2071,6 +3000,14 @@ impl Editor {
         self.new_file_from_document(
             action,
             Document::default(self.config.clone(), self.syn_loader.clone()),
+        )
+    }
+
+    /// Use when Helix is opened with no arguments passed
+    pub fn new_file_welcome(&mut self) -> DocumentId {
+        self.new_file_from_document(
+            Action::VerticalSplit,
+            Document::default(self.config.clone(), self.syn_loader.clone()).with_welcome(),
         )
     }
 
@@ -2103,9 +3040,11 @@ impl Editor {
         let path = helix_stdx::path::canonicalize(path);
         let id = self.document_id_by_path(&path);
 
+        let mut id_was_new = false;
         let id = if let Some(id) = id {
             id
         } else {
+            id_was_new = true;
             let mut doc = Document::open(
                 &path,
                 None,
@@ -2130,26 +3069,84 @@ impl Editor {
             );
 
             let id = self.new_document(doc);
+
             self.launch_language_servers(id);
 
             helix_event::dispatch(DocumentDidOpen {
                 editor: self,
                 doc: id,
+                path: &path,
             });
 
             id
         };
 
+        let new_doc = id_was_new;
         self.switch(id, action);
+
+        // Restore file position from persistent history when enabled.
+        // This needs to happen after switch, since switch messes with view offsets.
+        if new_doc
+            && self.config().persistence.old_files
+            && !self
+                .config()
+                .persistence
+                .old_files_exclusions
+                .iter()
+                .any(|r| r.is_match(&path.to_string_lossy()))
+        {
+            if let Some((view_position, selection)) =
+                self.old_file_locs.get(&path).map(|x| x.to_owned())
+            {
+                let (view, doc) = current!(self);
+
+                let doc_len = doc.text().len_chars();
+                // Don't restore if selection goes beyond the file's end
+                if !selection.ranges().iter().any(|range| range.to() > doc_len) {
+                    doc.set_view_offset(view.id, view_position);
+                    doc.set_selection(view.id, selection);
+                }
+            }
+        }
 
         Ok(id)
     }
 
     pub fn close(&mut self, id: ViewId) {
-        // Remove selections for the closed view on all documents.
+        let mut file_locs = Vec::new();
+
         for doc in self.documents_mut() {
+            // Persist file location history for this view
+            if doc.selections().contains_key(&id) {
+                if let Some(path) = doc.path() {
+                    file_locs.push(FileHistoryEntry::new(
+                        path.to_path_buf(),
+                        doc.view_offset(id),
+                        doc.selection(id).clone(),
+                    ));
+                }
+            }
+
+            // Remove selections for the closed view on all documents.
             doc.remove_view(id);
         }
+
+        if self.config().persistence.old_files {
+            for loc in file_locs {
+                if !self
+                    .config()
+                    .persistence
+                    .old_files_exclusions
+                    .iter()
+                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
+                {
+                    persistence::push_file_history(&loc);
+                    self.old_file_locs
+                        .insert(loc.path, (loc.view_position, loc.selection));
+                }
+            }
+        }
+
         self.tree.remove(id);
         self._refresh();
     }
@@ -2171,6 +3168,8 @@ impl Editor {
             ReplaceDoc(ViewId, DocumentId),
         }
 
+        let mut file_locs = Vec::new();
+
         let actions: Vec<Action> = self
             .tree
             .views_mut()
@@ -2178,6 +3177,14 @@ impl Editor {
                 view.remove_document(&doc_id);
 
                 if view.doc == doc_id {
+                    if let Some(path) = doc.path() {
+                        file_locs.push(FileHistoryEntry::new(
+                            path.to_path_buf(),
+                            doc.view_offset(view.id),
+                            doc.selection(view.id).clone(),
+                        ));
+                    }
+
                     // something was previously open in the view, switch to previous doc
                     if let Some(prev_doc) = view.docs_access_history.pop() {
                         Some(Action::ReplaceDoc(view.id, prev_doc))
@@ -2190,6 +3197,22 @@ impl Editor {
                 }
             })
             .collect();
+
+        if self.config().persistence.old_files {
+            for loc in file_locs {
+                if !self
+                    .config()
+                    .persistence
+                    .old_files_exclusions
+                    .iter()
+                    .any(|r| r.is_match(&loc.path.to_string_lossy()))
+                {
+                    persistence::push_file_history(&loc);
+                    self.old_file_locs
+                        .insert(loc.path, (loc.view_position, loc.selection));
+                }
+            }
+        }
 
         for action in actions {
             match action {
@@ -2323,6 +3346,15 @@ impl Editor {
 
     pub fn transpose_view(&mut self) {
         self.tree.transpose();
+    }
+
+    pub fn resize_buffer(&mut self, resize_type: Resize, dimension: Dimension) {
+        self.tree
+            .resize_buffer(resize_type, dimension, &self.config());
+    }
+
+    pub fn toggle_focus_window(&mut self) {
+        self.tree.toggle_focus_window();
     }
 
     pub fn should_close(&self) -> bool {

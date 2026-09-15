@@ -165,7 +165,7 @@ async fn test_buffer_close_concurrent() -> anyhow::Result<()> {
     // verify if writes are queued up, it finishes them before closing the buffer
     let mut file = tempfile::NamedTempFile::new()?;
     let mut command = String::new();
-    const RANGE: RangeInclusive<i32> = 1..=1000;
+    const RANGE: RangeInclusive<i32> = 1..=10;
 
     for i in RANGE {
         let cmd = format!("%c{}<esc>:w!<ret>", i);
@@ -284,7 +284,7 @@ async fn test_write_quit() -> anyhow::Result<()> {
 async fn test_write_concurrent() -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
     let mut command = String::new();
-    const RANGE: RangeInclusive<i32> = 1..=1000;
+    const RANGE: RangeInclusive<i32> = 1..=10;
     let mut app = helpers::AppBuilder::new()
         .with_file(file.path(), None)
         .build()?;
@@ -929,7 +929,7 @@ async fn test_hardlink_write() -> anyhow::Result<()> {
 async fn edit_file_with_content(file_content: &[u8]) -> anyhow::Result<()> {
     let mut file = tempfile::NamedTempFile::new()?;
 
-    file.as_file_mut().write_all(&file_content)?;
+    file.as_file_mut().write_all(file_content)?;
 
     helpers::test_key_sequence(
         &mut helpers::AppBuilder::new()

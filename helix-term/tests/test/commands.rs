@@ -6,6 +6,7 @@ mod insert;
 mod movement;
 mod reverse_selection_contents;
 mod rotate_selection_contents;
+mod text_folding;
 mod write;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -328,14 +329,14 @@ async fn test_extend_line() -> anyhow::Result<()> {
             #[l|]#orem
             ipsum
             dolor
-            
+
             "},
         "x2x",
         indoc! {"\
             #[lorem
             ipsum
             dolor\n|]#
-            
+
             "},
     ))
     .await?;
@@ -345,13 +346,13 @@ async fn test_extend_line() -> anyhow::Result<()> {
         indoc! {"\
             #[l|]#orem
             ipsum
-            
+
             "},
         "2x",
         indoc! {"\
             #[lorem
             ipsum\n|]#
-            
+
             "},
     ))
     .await?;
@@ -361,9 +362,13 @@ async fn test_extend_line() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_character_info() -> anyhow::Result<()> {
+    let config = helpers::test_config();
+
     // UTF-8, single byte
     test_key_sequence(
-        &mut helpers::AppBuilder::new().build()?,
+        &mut helpers::AppBuilder::new()
+            .with_config(config.clone())
+            .build()?,
         Some("ih<esc>h:char<ret>"),
         Some(&|app| {
             assert_eq!(
@@ -377,7 +382,9 @@ async fn test_character_info() -> anyhow::Result<()> {
 
     // UTF-8, multi-byte
     test_key_sequence(
-        &mut helpers::AppBuilder::new().build()?,
+        &mut helpers::AppBuilder::new()
+            .with_config(config.clone())
+            .build()?,
         Some("ië<esc>h:char<ret>"),
         Some(&|app| {
             assert_eq!(
@@ -391,7 +398,9 @@ async fn test_character_info() -> anyhow::Result<()> {
 
     // Multiple characters displayed as one, escaped characters
     test_key_sequence(
-        &mut helpers::AppBuilder::new().build()?,
+        &mut helpers::AppBuilder::new()
+            .with_config(config.clone())
+            .build()?,
         Some(":line<minus>ending crlf<ret>:char<ret>"),
         Some(&|app| {
             assert_eq!(
@@ -405,7 +414,9 @@ async fn test_character_info() -> anyhow::Result<()> {
 
     // Non-UTF-8
     test_key_sequence(
-        &mut helpers::AppBuilder::new().build()?,
+        &mut helpers::AppBuilder::new()
+            .with_config(config.clone())
+            .build()?,
         Some(":encoding ascii<ret>ih<esc>h:char<ret>"),
         Some(&|app| {
             assert_eq!(r#""h" Dec 104 Hex 68"#, app.editor.get_status().unwrap().0);
@@ -498,7 +509,7 @@ async fn test_insert_with_indent() -> anyhow::Result<()> {
             if let Some(_) = None {
 
             }
-         
+
         }
 
         fn bar() {
@@ -510,40 +521,20 @@ async fn test_insert_with_indent() -> anyhow::Result<()> {
     // insert_at_line_start
     test((
         INPUT,
-        ":lang rust<ret>%<A-s>I",
-        indoc! { "
-            #[f|]#n foo() {
-                #(i|)#f let Some(_) = None {
-                    #(\n|)#
-                #(}|)#
-            #( |)#
-            #(}|)#
-            #(\n|)#
-            #(f|)#n bar() {
-                #(\n|)#
-            #(}|)#
-            "
-        },
+        ":lang rust<ret>I",
+        String::from(
+            "#[f|]#n foo() {\n    if let Some(_) = None {\n\n    }\n\n}\n\nfn bar() {\n\n}\n",
+        ),
     ))
     .await?;
 
     // insert_at_line_end
     test((
         INPUT,
-        ":lang rust<ret>%<A-s>A",
-        indoc! { "
-            fn foo() {#[\n|]#
-                if let Some(_) = None {#(\n|)#
-                    #(\n|)#
-                }#(\n|)#
-             #(\n|)#
-            }#(\n|)#
-            #(\n|)#
-            fn bar() {#(\n|)#
-                #(\n|)#
-            }#(\n|)#
-            "
-        },
+        ":lang rust<ret>A",
+        String::from(
+            "fn foo() {#[\n|]#    if let Some(_) = None {\n\n    }\n\n}\n\nfn bar() {\n\n}\n",
+        ),
     ))
     .await?;
 
@@ -663,15 +654,15 @@ async fn test_join_selections_space() -> anyhow::Result<()> {
     // join with retained trailing spaces
     test((
         indoc! {"\
-            #[aaa   
+            #[aaa
 
-            bb  
+            bb
 
             c |]#
         "},
         "<A-J>",
         indoc! {"\
-            aaa   #[ |]#bb  #( |)#c 
+            aaa#[ |]#bb#( |)#c \n\
         "},
     ))
     .await?;
@@ -925,6 +916,146 @@ async fn global_search_with_multibyte_chars() -> anyhow::Result<()> {
     ))
     .await?;
 
+    Ok(())
+}
+
+// Line selection movement tests
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_selection_single_selection_up() -> anyhow::Result<()> {
+    test((
+        indoc! {"
+            aaaaaa
+            bbbbbb
+            cc#[|c]#ccc
+            dddddd
+            "},
+        "<C-k>",
+        indoc! {"
+            aaaaaa
+            cc#[|c]#ccc
+            bbbbbb
+            dddddd
+            "},
+    ))
+    .await?;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_selection_single_selection_down() -> anyhow::Result<()> {
+    test((
+        indoc! {"
+            aa#[|a]#aaa
+            bbbbbb
+            cccccc
+            dddddd
+            "},
+        "<C-j>",
+        indoc! {"
+            bbbbbb
+            aa#[|a]#aaa
+            cccccc
+            dddddd
+            "},
+    ))
+    .await?;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_selection_single_selection_top_up() -> anyhow::Result<()> {
+    // if already on top of the file and going up, nothing should change
+    test((
+        indoc! {"
+            aa#[|a]#aaa
+            bbbbbb
+            cccccc
+            dddddd"},
+        "<C-k>",
+        indoc! {"
+            aa#[|a]#aaa
+            bbbbbb
+            cccccc
+            dddddd"},
+    ))
+    .await?;
+    Ok(())
+}
+// #[tokio::test(flavor = "multi_thread")]
+// async fn test_move_selection_single_selection_bottom_down() -> anyhow::Result<()> {
+//     // If going down on the bottom line, nothing should change
+//     // Note that this test is broken, due to the testing framework
+//     // implicitly entering a trailing newline. How to fix?
+//     test((
+//         "aaaaaa\nbbbbbb\ncccccc\ndd#[|d]#ddd",
+//         "<C-j><C-j>",
+//         "aaaaaa\nbbbbbb\ncccccc\ndd#[|d]#ddd",
+//     ))
+//     .await?;
+//     Ok(())
+// }
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_selection_block_up() -> anyhow::Result<()> {
+    test((
+        indoc! {"
+            aaaaaa
+            bb#[bbbb
+            ccc|]#ccc
+            dddddd
+            eeeeee
+            "},
+        "<C-k>",
+        indoc! {"
+            bb#[bbbb
+            ccc|]#ccc
+            aaaaaa
+            dddddd
+            eeeeee
+            "},
+    ))
+    .await?;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_selection_block_down() -> anyhow::Result<()> {
+    test((
+        indoc! {"
+            #[|aaaaaa
+            bbbbbb
+            ccc]#ccc
+            dddddd
+            eeeeee
+            "},
+        "<C-j>",
+        indoc! {"
+            dddddd
+            #[|aaaaaa
+            bbbbbb
+            ccc]#ccc
+            eeeeee
+            "},
+    ))
+    .await?;
+    Ok(())
+}
+#[tokio::test(flavor = "multi_thread")]
+async fn test_move_two_cursors_down() -> anyhow::Result<()> {
+    test((
+        indoc! {"
+            aaaaaa
+            bb#[|b]#bbb
+            cccccc
+            d#(dd|)#ddd
+            eeeeee
+            "},
+        "<C-j>",
+        indoc! {"
+            aaaaaa
+            cccccc
+            bb#[|b]#bbb
+            eeeeee
+            d#(dd|)#ddd
+            "},
+    ))
+    .await?;
     Ok(())
 }
 

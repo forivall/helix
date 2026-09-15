@@ -8,6 +8,7 @@ use crate::{
     ui::{
         self,
         document::{render_document, LinePos, TextRenderer},
+        gradient_border::GradientBorder,
         picker::query::PickerQuery,
         text_decorations::DecorationManager,
         EditorView,
@@ -42,12 +43,14 @@ use std::{
 use crate::ui::{Prompt, PromptEvent};
 use helix_core::{
     char_idx_at_visual_offset, fuzzy::MATCHER, movement::Direction,
-    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation, Position,
+    text_annotations::TextAnnotations, unicode::segmentation::UnicodeSegmentation,
+    visual_offset_from_anchor, Position,
 };
 use helix_view::{
     editor::Action,
     graphics::{CursorKind, Margin, Modifier, Rect},
     gutter,
+    input::KeyEvent,
     theme::Style,
     view::ViewPosition,
     Document, DocumentId, Editor,
@@ -58,6 +61,7 @@ use self::handlers::{DynamicQueryChange, DynamicQueryHandler, PreviewHighlightHa
 pub const ID: &str = "picker";
 
 pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
+pub const MIN_AREA_HEIGHT_FOR_PREVIEW: u16 = 24;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
@@ -260,6 +264,7 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
 
     callback_fn: PickerCallback<T>,
     default_action: Action,
+    custom_key_handlers: PickerKeyHandlers<T, D>,
 
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -272,6 +277,20 @@ pub struct Picker<T: 'static + Send + Sync, D: 'static> {
     /// An event handler for syntax highlighting the currently previewed file.
     preview_highlight_handler: Sender<Arc<Path>>,
     dynamic_query_handler: Option<Sender<DynamicQueryChange>>,
+
+    /// Vertical scroll of the file preview, in visual (soft-wrapped) rows relative to
+    /// the natural top of the preview. Positive scrolls down, negative scrolls up.
+    preview_scroll_offset: isize,
+    /// Height in rows of the preview pane's inner text area, used for page scrolling.
+    preview_height: u16,
+    /// Selected item the current `preview_scroll_offset` applies to; the scroll resets
+    /// to the top when the selection changes.
+    preview_scroll_cursor: u32,
+
+    /// Cached gradient border for rendering when enabled in config
+    gradient_border: Option<GradientBorder>,
+    /// Title to display at the top of the picker
+    title: Option<&'static str>,
 }
 
 impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
@@ -312,10 +331,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         F: Fn(&mut Context, &T, Action) + 'static,
     {
         let columns: Arc<[_]> = columns.into_iter().collect();
-        let matcher_columns = columns
-            .iter()
-            .filter(|col: &&Column<T, D>| col.filter)
-            .count() as u32;
+        let matcher_columns = columns.iter().filter(|col| col.filter).count() as u32;
         assert!(matcher_columns > 0);
         let matcher = Nucleo::new(
             Config::DEFAULT,
@@ -393,12 +409,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             completion_height: 0,
             widths,
             preview_cache: HashMap::new(),
+            custom_key_handlers: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: None,
             range_fn: None,
             preview_highlight_handler: PreviewHighlightHandler::<T, D>::default().spawn(),
             dynamic_query_handler: None,
+            preview_scroll_offset: 0,
+            preview_height: 0,
+            preview_scroll_cursor: 0,
+            gradient_border: None,
+            title: None,
         }
+    }
+
+    pub fn with_key_handlers(mut self, handlers: PickerKeyHandlers<T, D>) -> Self {
+        self.custom_key_handlers = handlers;
+        self
     }
 
     pub fn injector(&self) -> Injector<T, D> {
@@ -441,8 +468,14 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         self
     }
 
-    pub fn with_initial_cursor(mut self, cursor: u32) -> Self {
-        self.cursor = cursor;
+    pub fn show_preview(mut self, show_preview: bool) -> Self {
+        self.show_preview = show_preview;
+        self
+    }
+
+    /// Set a title to display at the top of the picker
+    pub fn with_title(mut self, title: &'static str) -> Self {
+        self.title = Some(title);
         self
     }
 
@@ -465,6 +498,23 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
     pub fn with_default_action(mut self, action: Action) -> Self {
         self.default_action = action;
         self
+    }
+
+    /// Scrolls the file preview by `amount` visual lines, down for a positive amount and
+    /// up for a negative one.
+    ///
+    /// The offset is counted in visual (soft-wrapped) rows so a file with long lines can
+    /// be scrolled to its end one wrapped row at a time. It is clamped against the file
+    /// bounds later, when the preview is rendered and the soft-wrap layout is known.
+    fn scroll_preview(&mut self, amount: isize) {
+        self.preview_scroll_offset = self.preview_scroll_offset.saturating_add(amount);
+    }
+
+    /// Whether a scrollable file preview is currently shown. Pickers without a preview
+    /// callback (no `file_fn`) or with the preview toggled off route preview-scroll keys
+    /// back to result-list navigation.
+    fn preview_shown(&self) -> bool {
+        self.show_preview && self.file_fn.is_some()
     }
 
     /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
@@ -510,6 +560,11 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             .saturating_sub(1);
     }
 
+    pub fn with_cursor(mut self, cursor: u32) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
     pub fn selection(&self) -> Option<&T> {
         self.matcher
             .snapshot()
@@ -534,6 +589,17 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
 
     pub fn toggle_preview(&mut self) {
         self.show_preview = !self.show_preview;
+    }
+
+    fn custom_key_event_handler(&mut self, event: &KeyEvent, cx: &mut Context) -> EventResult {
+        if let (Some(callback), Some(selected)) =
+            (self.custom_key_handlers.get(event), self.selection())
+        {
+            callback(cx, selected, Arc::clone(&self.editor_data), self.cursor);
+            EventResult::Consumed(None)
+        } else {
+            EventResult::Ignored(None)
+        }
     }
 
     fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
@@ -631,7 +697,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     // retrieve the `Arc<Path>` key. The `path` in scope here is a `&Path` and
                     // we can cheaply clone the key for the preview highlight handler.
                     let (path, preview) = self.preview_cache.get_key_value(path).unwrap();
-                    if matches!(preview, CachedPreview::Document(doc) if doc.syntax().is_none()) {
+                    if matches!(preview, CachedPreview::Document(doc) if doc.language_config().is_none())
+                    {
                         helix_event::send_blocking(&self.preview_highlight_handler, path.clone());
                     }
                     if let CachedPreview::Document(doc) = preview {
@@ -650,12 +717,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                             let files = super::directory_content(&path, editor)?;
                             let file_names: Vec<_> = files
                                 .iter()
-                                .filter_map(|(file_path, is_dir)| {
-                                    let name = file_path
-                                        .strip_prefix(&path)
-                                        .map(|p| Some(p.as_os_str()))
-                                        .unwrap_or_else(|_| file_path.file_name())?
-                                        .to_string_lossy();
+                                .filter_map(|(path, is_dir)| {
+                                    let name = path.file_name()?.to_string_lossy();
                                     if *is_dir {
                                         Some((format!("{}/", name), true))
                                     } else {
@@ -678,39 +741,46 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                             if is_binary {
                                 return Ok(CachedPreview::Binary);
                             }
-                            let mut doc = Document::open(
+                            Document::open(
                                 &path,
                                 None,
                                 false,
                                 editor.config.clone(),
                                 editor.syn_loader.clone(),
                             )
-                            .or(Err(std::io::Error::new(
-                                std::io::ErrorKind::NotFound,
-                                "Cannot open document",
-                            )))?;
-                            let loader = editor.syn_loader.load();
-                            if let Some(language_config) = doc.detect_language_config(&loader) {
-                                doc.language = Some(language_config);
-                                // Asynchronously highlight the new document
-                                helix_event::send_blocking(
-                                    &self.preview_highlight_handler,
-                                    path.clone(),
-                                );
-                            }
-                            let trust_full = editor
-                                .workspace_trust
-                                .query(
-                                    doc.workspace_root(),
-                                    helix_loader::workspace_trust::TrustQuery::Git,
-                                )
-                                .is_trusted();
-                            if let Some(diff_base) =
-                                editor.diff_providers.get_diff_base(&path, trust_full)
-                            {
-                                doc.set_diff_base(diff_base);
-                            }
-                            Ok(CachedPreview::Document(Box::new(doc)))
+                            .map_or(
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    "Cannot open document",
+                                )),
+                                |mut doc| {
+                                    let loader = editor.syn_loader.load();
+                                    if let Some(language_config) =
+                                        doc.detect_language_config(&loader)
+                                    {
+                                        doc.language = Some(language_config);
+
+                                        // Asynchronously highlight the new document
+                                        helix_event::send_blocking(
+                                            &self.preview_highlight_handler,
+                                            path.clone(),
+                                        );
+                                    }
+                                    let trust_full = editor
+                                        .workspace_trust
+                                        .query(
+                                            doc.workspace_root(),
+                                            helix_loader::workspace_trust::TrustQuery::Git,
+                                        )
+                                        .is_trusted();
+                                    if let Some(diff_base) =
+                                        editor.diff_providers.get_diff_base(&path, trust_full)
+                                    {
+                                        doc.set_diff_base(diff_base);
+                                    }
+                                    Ok(CachedPreview::Document(Box::new(doc)))
+                                },
+                            )
                         } else {
                             Err(std::io::Error::new(
                                 std::io::ErrorKind::NotFound,
@@ -746,7 +816,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         }
 
         let text_style = cx.editor.theme.get("ui.text");
-        let selected = cx.editor.theme.get("ui.text.focus");
+        let selected = cx
+            .editor
+            .theme
+            .try_get("ui.text.focus")
+            .filter(|s| s.bg.is_some())
+            .unwrap_or_else(|| cx.editor.theme.get("ui.menu.selected"));
         let highlight_style = cx.editor.theme.get("special").add_modifier(Modifier::BOLD);
 
         // -- Render the frame:
@@ -754,12 +829,43 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let background = cx.editor.theme.get("ui.background");
         surface.clear_with(area, background);
 
-        const BLOCK: Block<'_> = Block::bordered();
+        // calculate the inner area inside the box (respect gradient border thickness)
+        let inner = if cx.editor.config().gradient_borders.enable {
+            if self.gradient_border.is_none() {
+                self.gradient_border = Some(GradientBorder::from_theme(
+                    &cx.editor.theme,
+                    &cx.editor.config().gradient_borders,
+                ));
+            }
 
-        // calculate the inner area inside the box
-        let inner = BLOCK.inner(area);
+            if let Some(ref mut gradient_border) = self.gradient_border {
+                let rounded = cx.editor.config().rounded_corners;
+                gradient_border.render_with_title(
+                    area,
+                    surface,
+                    &cx.editor.theme,
+                    self.title,
+                    rounded,
+                );
+            }
 
-        BLOCK.render(area, surface);
+            let t: u16 = cx.editor.config().gradient_borders.thickness as u16;
+            Rect {
+                x: area.x + t,
+                y: area.y + t,
+                width: area.width.saturating_sub(t * 2),
+                height: area.height.saturating_sub(t * 2),
+            }
+        } else {
+            let block = if let Some(title) = self.title {
+                Block::bordered().title(title)
+            } else {
+                Block::bordered()
+            };
+            let inner_area = block.inner(area);
+            block.render(area, surface);
+            inner_area
+        };
 
         // -- Render the input bar:
 
@@ -890,10 +996,12 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             }))
         });
 
+        let cfg = cx.editor.config();
+        let picker_symbol = cfg.picker_symbol.as_str();
         let mut table = Table::new(options)
             .style(text_style)
             .highlight_style(selected)
-            .highlight_symbol(" > ")
+            .highlight_symbol(picker_symbol)
             .column_spacing(1)
             .widths(&self.widths);
 
@@ -943,14 +1051,44 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
         let directory = cx.editor.theme.get("ui.text.directory");
         surface.clear_with(area, background);
 
-        const BLOCK: Block<'_> = Block::bordered();
-
-        // calculate the inner area inside the box
-        let inner = BLOCK.inner(area);
+        // calculate the inner area inside the box (respect gradient border thickness)
+        let base_inner = if cx.editor.config().gradient_borders.enable {
+            if self.gradient_border.is_none() {
+                self.gradient_border = Some(GradientBorder::from_theme(
+                    &cx.editor.theme,
+                    &cx.editor.config().gradient_borders,
+                ));
+            }
+            if let Some(ref mut gradient_border) = self.gradient_border {
+                let rounded = cx.editor.config().rounded_corners;
+                gradient_border.render(area, surface, &cx.editor.theme, rounded);
+            }
+            let t: u16 = cx.editor.config().gradient_borders.thickness as u16;
+            Rect {
+                x: area.x + t,
+                y: area.y + t,
+                width: area.width.saturating_sub(t * 2),
+                height: area.height.saturating_sub(t * 2),
+            }
+        } else {
+            let block = Block::bordered();
+            let inner_area = block.inner(area);
+            block.render(area, surface);
+            inner_area
+        };
         // 1 column gap on either side
         let margin = Margin::horizontal(1);
-        let inner = inner.inner(margin);
-        BLOCK.render(area, surface);
+        let inner = base_inner.inner(margin);
+
+        // Reset the preview scroll on a selection change, before the `get_preview` borrow.
+        if self.cursor != self.preview_scroll_cursor {
+            self.preview_scroll_offset = 0;
+            self.preview_scroll_cursor = self.cursor;
+        }
+
+        // `get_preview` borrows `self` for the block below, so the offset is read into a
+        // local here, clamped against the soft-wrap layout inside, then written back after.
+        let mut scroll = self.preview_scroll_offset;
 
         if let Some((preview, range)) = self.get_preview(cx.editor) {
             let doc = match preview.document() {
@@ -985,6 +1123,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                     return;
                 }
             };
+            let doc_height = doc.text().len_lines();
 
             let mut offset = ViewPosition::default();
             if let Some((start_line, end_line)) = range {
@@ -1013,11 +1152,93 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 }
             }
 
+            // Apply the preview scroll by moving the anchor by whole visual lines, so
+            // soft-wrapped lines scroll one wrapped row at a time. `offset.anchor` is the
+            // natural top of the preview (line 0, or the centred match for range previews)
+            // and is left untouched when there is no scroll, keeping that centring. An
+            // upward scroll is clamped to the start of the file by `char_idx_at_visual_offset`.
+            let mut at_bottom = false;
+            if scroll != 0 {
+                let text = doc.text().slice(..);
+                let text_fmt = doc.text_format(inner.width, None);
+                let annotations = TextAnnotations::default();
+                let natural_anchor = offset.anchor;
+
+                let (anchor, vertical_offset) = char_idx_at_visual_offset(
+                    text,
+                    natural_anchor,
+                    scroll,
+                    0,
+                    &text_fmt,
+                    &annotations,
+                );
+
+                // The anchor that keeps the file's last visual line on the bottom row, so a
+                // downward scroll can't run past the end into empty space. Found by walking
+                // up one viewport from the end: a screenful of rows at most.
+                let (max_anchor, _) = char_idx_at_visual_offset(
+                    text,
+                    text.len_chars().saturating_sub(1),
+                    -(inner.height as isize - 1),
+                    0,
+                    &text_fmt,
+                    &annotations,
+                );
+
+                if anchor >= max_anchor {
+                    at_bottom = true;
+                    offset.anchor = max_anchor;
+                    offset.vertical_offset = 0;
+
+                    // Scrolled past the bottom: clamp the stored offset to the scroll that
+                    // exactly reaches it, so the offset can't accumulate and the next upward
+                    // scroll responds at once. Measured between the in-range natural and
+                    // bottom anchors (not the applied anchor, which may sit past EOF where it
+                    // can't be measured), capped at the current offset.
+                    if anchor > max_anchor {
+                        let max_scroll = visual_offset_from_anchor(
+                            text,
+                            natural_anchor,
+                            max_anchor,
+                            &text_fmt,
+                            &annotations,
+                            scroll.unsigned_abs(),
+                        )
+                        .map_or(scroll, |(pos, _)| pos.row as isize);
+                        scroll = scroll.min(max_scroll);
+                    }
+                } else {
+                    offset.anchor = anchor;
+                    offset.vertical_offset = vertical_offset;
+
+                    // Past the top: `char_idx_at_visual_offset` already pinned the anchor to
+                    // the start, so normalise a negative offset to the rows actually
+                    // scrolled, keeping it from accumulating above the top.
+                    if scroll < 0 && anchor <= natural_anchor {
+                        scroll = visual_offset_from_anchor(
+                            text,
+                            anchor,
+                            natural_anchor,
+                            &text_fmt,
+                            &annotations,
+                            scroll.unsigned_abs(),
+                        )
+                        .map_or(scroll, |(pos, _)| -(pos.row as isize));
+                    }
+                }
+            }
+
             let loader = cx.editor.syn_loader.load();
             let config = cx.editor.config();
 
-            let syntax_highlighter =
-                EditorView::doc_syntax_highlighter(doc, offset.anchor, area.height, &loader);
+            let syntax_highlighter = EditorView::doc_syntax_highlighter(
+                doc,
+                &TextAnnotations::default(),
+                offset.anchor,
+                area.height,
+                &loader,
+            );
+            let annotations = TextAnnotations::default();
             let mut overlay_highlights = Vec::new();
             if doc
                 .language_config()
@@ -1026,6 +1247,7 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
             {
                 if let Some(overlay) = EditorView::doc_rainbow_highlights(
                     doc,
+                    &annotations,
                     offset.anchor,
                     area.height,
                     &cx.editor.theme,
@@ -1099,6 +1321,8 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 decorations.add_decoration(draw_highlight);
             }
 
+            let current_line = doc.text().slice(..).char_to_line(offset.anchor);
+
             render_document(
                 surface,
                 inner,
@@ -1111,40 +1335,96 @@ impl<T: 'static + Send + Sync, D: 'static + Send + Sync> Picker<T, D> {
                 &cx.editor.theme,
                 decorations,
             );
+
+            // Scroll indicator on the right edge. The thumb is placed from document lines,
+            // which is approximate when lines soft-wrap, so it is pinned to the end once the
+            // preview is scrolled to the bottom and otherwise clamped within the track.
+            let win_height = inner.height as usize;
+            let scroll_style = cx.editor.theme.get("ui.menu.scroll");
+
+            if doc_height > win_height {
+                let scroll_height = win_height.pow(2).div_ceil(doc_height).min(win_height);
+                let track = win_height - scroll_height;
+                let scroll_line = if at_bottom {
+                    track
+                } else {
+                    (track * current_line / std::cmp::max(1, doc_height.saturating_sub(win_height)))
+                        .min(track)
+                };
+
+                let mut cell;
+                for i in 0..win_height {
+                    cell = &mut surface[(inner.right() - 1, inner.top() + i as u16)];
+                    cell.set_symbol("▐");
+
+                    if scroll_line <= i && i < scroll_line + scroll_height {
+                        // thumb
+                        cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
+                    } else {
+                        // track
+                        cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
+                    }
+                }
+            }
         }
+
+        // Persist the offset clamped against the soft-wrap layout above.
+        self.preview_scroll_offset = scroll;
     }
 }
 
 impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I, D> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        // default render
+        // +--title--+ +---------+
         // +---------+ +---------+
         // |prompt   | |preview  |
         // +---------+ |         |
         // |picker   | |         |
         // |         | |         |
         // +---------+ +---------+
+        //
+        // stack vertically
+        // +---------+
+        // |prompt   |
+        // +---------+
+        // |picker   |
+        // |         |
+        // +---------+
+        // |preview  |
+        // |         |
+        // |         |
+        // +---------+
 
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        let render_preview = self.show_preview
+            && self.file_fn.is_some()
+            && area.width >= MIN_AREA_WIDTH_FOR_PREVIEW
+            && area.height >= MIN_AREA_HEIGHT_FOR_PREVIEW;
+        let stack_vertically = area.width / 2 < MIN_AREA_WIDTH_FOR_PREVIEW;
 
-        let picker_width = if render_preview {
-            area.width / 2
+        let picker_area = if render_preview {
+            if stack_vertically {
+                area.with_height(area.height / 3)
+            } else {
+                area.with_width(area.width / 2)
+            }
         } else {
-            area.width
+            area
         };
 
-        let picker_area = area.with_width(picker_width);
         self.render_picker(picker_area, surface, cx);
 
         if render_preview {
-            let preview_area = area.clip_left(picker_width);
+            let preview_area = if stack_vertically {
+                area.clip_top(picker_area.height)
+            } else {
+                area.clip_left(picker_area.width)
+            };
             self.render_preview(preview_area, surface, cx);
         }
     }
 
     fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
-        // TODO: keybinds for scrolling preview
-
         let key_event = match event {
             Event::Key(event) => *event,
             Event::Paste(..) => return self.prompt_handle_event(event, ctx),
@@ -1158,25 +1438,30 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
         let close_fn = |picker: &mut Self| {
             // if the picker is very large don't store it as last_picker to avoid
             // excessive memory consumption
-            let callback: compositor::Callback =
-                if picker.matcher.snapshot().item_count() > 1_000_000 {
-                    Box::new(|compositor: &mut Compositor, _ctx| {
-                        // remove the layer
-                        compositor.pop();
-                    })
-                } else {
-                    // stop streaming in new items in the background, really we should
-                    // be restarting the stream somehow once the picker gets
-                    // reopened instead (like for an FS crawl) that would also remove the
-                    // need for the special case above but that is pretty tricky
-                    picker.version.fetch_add(1, atomic::Ordering::Relaxed);
-                    Box::new(|compositor: &mut Compositor, _ctx| {
-                        // remove the layer
-                        compositor.last_picker = compositor.pop();
-                    })
-                };
+            let callback: compositor::Callback = if picker.matcher.snapshot().item_count() > 100_000
+            {
+                Box::new(|compositor: &mut Compositor, _ctx| {
+                    // remove the layer
+                    compositor.pop();
+                })
+            } else {
+                // stop streaming in new items in the background, really we should
+                // be restarting the stream somehow once the picker gets
+                // reopened instead (like for an FS crawl) that would also remove the
+                // need for the special case above but that is pretty tricky
+                picker.version.fetch_add(1, atomic::Ordering::Relaxed);
+                Box::new(|compositor: &mut Compositor, _ctx| {
+                    // remove the layer
+                    compositor.last_picker = compositor.pop();
+                })
+            };
             EventResult::Consumed(Some(callback))
         };
+
+        // handle custom keybindings, if exist
+        if let EventResult::Consumed(_) = self.custom_key_event_handler(&key_event, ctx) {
+            return EventResult::Consumed(None);
+        }
 
         match key_event {
             shift!(Tab) | key!(Up) | ctrl!('p') => {
@@ -1185,10 +1470,24 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(Tab) | key!(Down) | ctrl!('n') => {
                 self.move_by(1, Direction::Forward);
             }
-            key!(PageDown) | ctrl!('d') => {
+            // Ctrl-d/Ctrl-u always page the result list. PageDown/PageUp scroll the
+            // preview a full page when one is shown, and otherwise page the list.
+            ctrl!('d') => {
                 self.page_down();
             }
-            key!(PageUp) | ctrl!('u') => {
+            ctrl!('u') => {
+                self.page_up();
+            }
+            key!(PageDown) if self.preview_shown() => {
+                self.scroll_preview(self.preview_height as isize);
+            }
+            key!(PageUp) if self.preview_shown() => {
+                self.scroll_preview(-(self.preview_height as isize));
+            }
+            key!(PageDown) => {
+                self.page_down();
+            }
+            key!(PageUp) => {
                 self.page_up();
             }
             key!(Home) => {
@@ -1200,7 +1499,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             key!(Esc) | ctrl!('c') => return close_fn(self),
             alt!(Enter) => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(ctx, option, self.default_action);
+                    (self.callback_fn)(ctx, option, Action::Replace);
                 }
             }
             key!(Enter) => {
@@ -1224,7 +1523,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
                     self.handle_prompt_change(true);
                 } else {
                     if let Some(option) = self.selection() {
-                        (self.callback_fn)(ctx, option, self.default_action);
+                        (self.callback_fn)(ctx, option, Action::Replace);
                     }
                     if let Some(history_register) = self.prompt.history_register() {
                         if let Err(err) = ctx
@@ -1253,6 +1552,17 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
             ctrl!('t') => {
                 self.toggle_preview();
             }
+            // Preview line scrolling. Alt-d/f/b are intentionally avoided here: the prompt
+            // keybinds (which also apply in pickers) use them for word editing in the
+            // query, and full-page preview scrolling is already on PageUp/PageDown.
+            alt!('k') | shift!(Up) if self.preview_shown() => {
+                let lines = ctx.editor.config().scroll_lines.unsigned_abs() as isize;
+                self.scroll_preview(-lines);
+            }
+            alt!('j') | shift!(Down) if self.preview_shown() => {
+                let lines = ctx.editor.config().scroll_lines.unsigned_abs() as isize;
+                self.scroll_preview(lines);
+            }
             _ => {
                 self.prompt_handle_event(event, ctx);
             }
@@ -1262,18 +1572,31 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        let block = Block::bordered();
-        // calculate the inner area inside the box
-        let inner = block.inner(area);
+        // calculate the inner area inside the box, honoring gradient border thickness
+        let inner = if editor.config().gradient_borders.enable {
+            let t: u16 = editor.config().gradient_borders.thickness as u16;
+            Rect {
+                x: area.x + t,
+                y: area.y + t,
+                width: area.width.saturating_sub(t * 2),
+                height: area.height.saturating_sub(t * 2),
+            }
+        } else {
+            let block = Block::bordered();
+            block.inner(area)
+        };
 
         // prompt area
-        let render_preview =
-            self.show_preview && self.file_fn.is_some() && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
+        let render_preview = self.show_preview
+            && self.file_fn.is_some()
+            && area.width >= MIN_AREA_WIDTH_FOR_PREVIEW
+            && area.height >= MIN_AREA_HEIGHT_FOR_PREVIEW;
+        let stack_vertically = area.width / 2 < MIN_AREA_WIDTH_FOR_PREVIEW;
 
-        let picker_width = if render_preview {
-            area.width / 2
+        let picker_width = if render_preview && !stack_vertically {
+            inner.width / 2
         } else {
-            area.width
+            inner.width
         };
         let area = inner.clip_left(1).with_height(1).with_width(picker_width);
 
@@ -1282,6 +1605,7 @@ impl<I: 'static + Send + Sync, D: 'static + Send + Sync> Component for Picker<I,
 
     fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
         self.completion_height = height.saturating_sub(4 + self.header_height());
+        self.preview_height = height.saturating_sub(2);
         Some((width, height))
     }
 
@@ -1297,3 +1621,372 @@ impl<T: 'static + Send + Sync, D> Drop for Picker<T, D> {
 }
 
 type PickerCallback<T> = Box<dyn Fn(&mut Context, &T, Action)>;
+pub type PickerKeyHandler<T, D> = Box<dyn Fn(&mut Context, &T, Arc<D>, u32) + 'static>;
+pub type PickerKeyHandlers<T, D> = HashMap<KeyEvent, PickerKeyHandler<T, D>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ===========================================
+    // Picker Title Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_title_default_none() {
+        // Create a simple picker and verify title is None by default
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string(), "item2".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+
+        assert!(picker.title.is_none());
+    }
+
+    #[test]
+    fn test_picker_with_title() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .with_title("Test Title");
+
+        assert_eq!(picker.title, Some("Test Title"));
+    }
+
+    #[test]
+    fn test_picker_title_chaining() {
+        // Test that with_title can be chained with other builder methods
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["item1".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .truncate_start(false)
+        .with_title("Chained Title")
+        .show_preview(false);
+
+        assert_eq!(picker.title, Some("Chained Title"));
+        assert!(!picker.truncate_start);
+        assert!(!picker.show_preview);
+    }
+
+    #[test]
+    fn test_picker_title_empty_string() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {}).with_title("");
+
+        // Empty string is still Some("")
+        assert_eq!(picker.title, Some(""));
+    }
+
+    #[test]
+    fn test_picker_title_with_special_characters() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {})
+                .with_title("Files 📁 & Folders");
+
+        assert_eq!(picker.title, Some("Files 📁 & Folders"));
+    }
+
+    #[test]
+    fn test_picker_title_various_picker_types() {
+        // Test with different item types to ensure generics work correctly
+
+        // String items
+        let columns_str = [Column::new("name", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker_str: Picker<String, ()> = Picker::new(
+            columns_str,
+            0,
+            vec!["a".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .with_title("String Picker");
+        assert_eq!(picker_str.title, Some("String Picker"));
+
+        // Integer items
+        let columns_int = [Column::new("num", |item: &i32, _: &()| {
+            item.to_string().into()
+        })];
+        let picker_int: Picker<i32, ()> =
+            Picker::new(columns_int, 0, vec![1, 2, 3], (), |_cx, _item, _action| {})
+                .with_title("Integer Picker");
+        assert_eq!(picker_int.title, Some("Integer Picker"));
+    }
+
+    // ===========================================
+    // Picker Constants Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_id_constant() {
+        assert_eq!(ID, "picker");
+    }
+
+    #[test]
+    fn test_min_area_constants() {
+        assert_eq!(MIN_AREA_WIDTH_FOR_PREVIEW, 72);
+        assert_eq!(MIN_AREA_HEIGHT_FOR_PREVIEW, 24);
+    }
+
+    #[test]
+    fn test_max_file_size_for_preview() {
+        // 10 MB
+        assert_eq!(MAX_FILE_SIZE_FOR_PREVIEW, 10 * 1024 * 1024);
+    }
+
+    // ===========================================
+    // Picker Movement Tests
+    // ===========================================
+
+    #[test]
+    fn test_picker_cursor_starts_at_zero() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+
+        assert_eq!(picker.cursor, 0);
+    }
+
+    // ===========================================
+    // Preview Scroll Tests
+    // ===========================================
+
+    #[test]
+    fn test_scroll_preview_default_zero() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        assert_eq!(picker.preview_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_scroll_preview_positive() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(5);
+        assert_eq!(picker.preview_scroll_offset, 5);
+    }
+
+    #[test]
+    fn test_scroll_preview_negative() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(-3);
+        assert_eq!(picker.preview_scroll_offset, -3);
+    }
+
+    #[test]
+    fn test_scroll_preview_accumulates() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(10);
+        picker.scroll_preview(-3);
+        assert_eq!(picker.preview_scroll_offset, 7);
+    }
+
+    #[test]
+    fn test_scroll_preview_saturation_positive() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(isize::MAX);
+        picker.scroll_preview(1);
+        // Should not overflow, should stay at isize::MAX
+        assert_eq!(picker.preview_scroll_offset, isize::MAX);
+    }
+
+    #[test]
+    fn test_scroll_preview_saturation_negative() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(isize::MIN);
+        picker.scroll_preview(-1);
+        // Should not underflow, should stay at isize::MIN
+        assert_eq!(picker.preview_scroll_offset, isize::MIN);
+    }
+
+    #[test]
+    fn test_scroll_preview_resets_to_zero() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        picker.scroll_preview(42);
+        assert_eq!(picker.preview_scroll_offset, 42);
+        picker.preview_scroll_offset = 0;
+        assert_eq!(picker.preview_scroll_offset, 0);
+    }
+
+    #[test]
+    fn test_preview_shown_no_file_fn() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        // Default show_preview is true, but file_fn is None
+        assert!(!picker.preview_shown());
+    }
+
+    #[test]
+    fn test_preview_shown_with_file_fn() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {})
+                .with_preview(|_editor, _item| None);
+        assert!(picker.preview_shown());
+    }
+
+    #[test]
+    fn test_preview_shown_toggled_off() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["a".to_string(), "b".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        )
+        .with_preview(|_editor, _item| None)
+        .show_preview(false);
+        assert!(!picker.preview_shown());
+    }
+
+    #[test]
+    fn test_preview_scroll_cursor_tracks_selection() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["a".to_string(), "b".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+        // Initially cursor and preview_scroll_cursor are both 0
+        assert_eq!(picker.cursor, 0);
+        assert_eq!(picker.preview_scroll_cursor, 0);
+
+        // Set a scroll offset
+        picker.scroll_preview(10);
+        assert_eq!(picker.preview_scroll_offset, 10);
+
+        // Change cursor (simulating selection change)
+        picker.cursor = 1;
+
+        // The render_preview method resets scroll when cursor != preview_scroll_cursor
+        // We simulate the check here (same logic as in render_preview)
+        if picker.cursor != picker.preview_scroll_cursor {
+            picker.preview_scroll_offset = 0;
+            picker.preview_scroll_cursor = picker.cursor;
+        }
+
+        assert_eq!(picker.preview_scroll_offset, 0);
+        assert_eq!(picker.preview_scroll_cursor, 1);
+    }
+
+    #[test]
+    fn test_preview_scroll_cursor_no_reset_on_same_selection() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> = Picker::new(
+            columns,
+            0,
+            vec!["a".to_string(), "b".to_string()],
+            (),
+            |_cx, _item, _action| {},
+        );
+        picker.preview_scroll_cursor = 0;
+        picker.scroll_preview(10);
+
+        // Cursor hasn't changed, scroll should not be reset
+        if picker.cursor != picker.preview_scroll_cursor {
+            picker.preview_scroll_offset = 0;
+            picker.preview_scroll_cursor = picker.cursor;
+        }
+
+        assert_eq!(picker.preview_scroll_offset, 10);
+    }
+
+    #[test]
+    fn test_required_size_sets_preview_height() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let mut picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+
+        assert_eq!(picker.preview_height, 0);
+
+        picker.required_size((100, 50));
+        // preview_height = height - 2 (for borders) = 48
+        assert_eq!(picker.preview_height, 48);
+    }
+
+    #[test]
+    fn test_preview_scroll_cursor_initial_value() {
+        let columns = [Column::new("test", |item: &String, _: &()| {
+            item.as_str().into()
+        })];
+        let picker: Picker<String, ()> =
+            Picker::new(columns, 0, vec![], (), |_cx, _item, _action| {});
+        assert_eq!(picker.preview_scroll_cursor, 0);
+    }
+}

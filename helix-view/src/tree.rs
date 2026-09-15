@@ -29,6 +29,16 @@ pub enum Content {
     Container(Box<Container>),
 }
 
+pub enum Resize {
+    Shrink,
+    Grow,
+}
+
+pub enum Dimension {
+    Width,
+    Height,
+}
+
 impl Node {
     pub fn container(layout: Layout) -> Self {
         Self {
@@ -65,6 +75,14 @@ pub struct Container {
     layout: Layout,
     children: Vec<ViewId>,
     area: Rect,
+    node_bounds: Vec<ContainerBounds>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ContainerBounds {
+    width: usize,
+    height: usize,
+    expand: bool,
 }
 
 impl Container {
@@ -73,7 +91,76 @@ impl Container {
             layout,
             children: Vec::new(),
             area: Rect::default(),
+            node_bounds: Vec::new(),
         }
+    }
+
+    fn get_child_by_view_id(&mut self, node: ViewId) -> Option<&mut ContainerBounds> {
+        self.children
+            .iter()
+            .position(|child| child == &node)
+            .and_then(|index| self.node_bounds.get_mut(index))
+    }
+
+    fn push_child(&mut self, node: ViewId) -> &mut Self {
+        self.children.push(node);
+        self.add_child_bounds();
+        self
+    }
+
+    fn insert_child(&mut self, index: usize, node: ViewId) -> &mut Self {
+        self.children.insert(index, node);
+        self.insert_child_bounds(index);
+        self
+    }
+
+    fn add_child_bounds(&mut self) -> &mut Self {
+        self.node_bounds.push(ContainerBounds {
+            width: 10,
+            height: 10,
+            expand: false,
+        });
+        self
+    }
+
+    fn insert_child_bounds(&mut self, index: usize) -> &mut Self {
+        self.node_bounds.insert(
+            index,
+            ContainerBounds {
+                width: 10,
+                height: 10,
+                expand: false,
+            },
+        );
+        self
+    }
+
+    fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    fn children_count(&self) -> usize {
+        self.children.len()
+    }
+
+    fn calculate_slots_width(&self) -> usize {
+        self.node_bounds
+            .iter()
+            .map(|bounds| match bounds.expand {
+                true => 40,
+                false => bounds.width,
+            })
+            .sum()
+    }
+
+    fn calculate_slots_height(&self) -> usize {
+        self.node_bounds
+            .iter()
+            .map(|bounds| match bounds.expand {
+                true => 40,
+                false => bounds.height,
+            })
+            .sum()
     }
 }
 
@@ -131,7 +218,7 @@ impl Tree {
             pos + 1
         };
 
-        container.children.insert(pos, node);
+        container.insert_child(pos, node);
         // focus the new node
         self.focus = node;
 
@@ -168,7 +255,7 @@ impl Tree {
                     .unwrap();
                 pos + 1
             };
-            container.children.insert(pos, node);
+            container.insert_child(pos, node);
             self.nodes[node].parent = parent;
         } else {
             let mut split = Node::container(layout);
@@ -182,8 +269,8 @@ impl Tree {
                 } => container,
                 _ => unreachable!(),
             };
-            container.children.push(focus);
-            container.children.push(node);
+            container.push_child(focus);
+            container.push_child(node);
             self.nodes[focus].parent = split;
             self.nodes[node].parent = split;
 
@@ -244,6 +331,86 @@ impl Tree {
             self.nodes[new].parent = parent;
         } else {
             container.children.remove(pos);
+            container.node_bounds.remove(pos);
+        }
+    }
+
+    /// If the container at `container_id` has the same layout as its grandparent,
+    /// dissolve the container by promoting its children into the grandparent.
+    ///
+    /// This eliminates unnecessary nesting that can arise from alternating split
+    /// directions, ensuring correct proportional size distribution after removal.
+    ///
+    /// Does nothing if:
+    /// - `container_id` is the root
+    /// - The container has no children
+    /// - The container's layout differs from its grandparent's layout
+    fn flatten_container_if_same_layout(&mut self, container_id: ViewId) {
+        if container_id == self.root {
+            return;
+        }
+
+        let grandparent = self.nodes[container_id].parent;
+
+        let container_layout = self.container(container_id).layout();
+        let container_children_count = self.container(container_id).children_count();
+
+        if container_children_count == 0 {
+            return;
+        }
+
+        let grandparent_layout = self.container(grandparent).layout();
+
+        if container_layout != grandparent_layout {
+            return;
+        }
+
+        // Find the position of this container in grandparent's children.
+        let pos = {
+            let grandparent_container = self.container_mut(grandparent);
+            grandparent_container
+                .children
+                .iter()
+                .position(|&child| child == container_id)
+                .unwrap()
+        };
+
+        // Move children and bounds out of the container being dissolved.
+        let (promoted_children, promoted_bounds) = {
+            let container = self.container_mut(container_id);
+            let children: Vec<ViewId> = container.children.drain(..).collect();
+            let bounds: Vec<ContainerBounds> = container.node_bounds.drain(..).collect();
+            (children, bounds)
+        };
+
+        // Update parent pointers for all promoted children.
+        for &child in &promoted_children {
+            self.nodes[child].parent = grandparent;
+        }
+
+        // Splice promoted children into grandparent at the dissolved container's position.
+        let grandparent_container = self.container_mut(grandparent);
+        grandparent_container
+            .children
+            .splice(pos..pos + 1, promoted_children);
+        grandparent_container
+            .node_bounds
+            .splice(pos..pos + 1, promoted_bounds);
+
+        // Remove the now-empty container from the slotmap.
+        self.nodes.remove(container_id);
+    }
+
+    /// Get an immutable reference to a [Container] by index.
+    /// # Panics
+    /// Panics if `index` is not in self.nodes, or if the node's content is not a [Content::Container].
+    fn container(&self, index: ViewId) -> &Container {
+        match &self.nodes[index] {
+            Node {
+                content: Content::Container(container),
+                ..
+            } => container,
+            _ => unreachable!(),
         }
     }
 
@@ -258,13 +425,28 @@ impl Tree {
 
         self.remove_or_replace(index, None);
 
+        let mut flatten_target = parent;
         let parent_container = self.container_mut(parent);
         if parent_container.children.len() == 1 && !parent_is_root {
             // Lets merge the only child back to its grandparent so that Views
             // are equally spaced.
             let sibling = parent_container.children.pop().unwrap();
             self.remove_or_replace(parent, Some(sibling));
+            // The promoted sibling may now have the same layout as its new
+            // parent (the grandparent). If so, it should be flattened.
+            if matches!(self.nodes[sibling].content, Content::Container(_)) {
+                flatten_target = sibling;
+            } else {
+                // View sibling promoted; nothing to flatten.
+                self.recalculate();
+                return;
+            }
         }
+
+        // Flatten any container whose layout matches its grandparent's layout.
+        // This eliminates unnecessary nesting from alternating split directions,
+        // ensuring correct proportional size distribution.
+        self.flatten_container_if_same_layout(flatten_target);
 
         self.recalculate()
     }
@@ -382,12 +564,17 @@ impl Tree {
                     match container.layout {
                         Layout::Horizontal => {
                             let len = container.children.len();
-
-                            let height = area.height / len as u16;
-
+                            let slots = container.calculate_slots_height();
+                            let slot_height = area.height as f32 / slots as f32;
                             let mut child_y = area.y;
 
                             for (i, child) in container.children.iter().enumerate() {
+                                let bounds = container.node_bounds[i];
+                                let height = match bounds.expand {
+                                    true => (40.0 * slot_height) as u16,
+                                    false => (slot_height * bounds.height as f32).floor() as u16,
+                                };
+
                                 let mut area = Rect::new(
                                     container.area.x,
                                     child_y,
@@ -396,7 +583,7 @@ impl Tree {
                                 );
                                 child_y += height;
 
-                                // last child takes the remaining width because we can get uneven
+                                // last child takes the remaining height because we can get uneven
                                 // space from rounding
                                 if i == len - 1 {
                                     area.height = container.area.y + container.area.height - area.y;
@@ -410,24 +597,58 @@ impl Tree {
                             let len_u16 = len as u16;
 
                             let inner_gap = 1u16;
-                            let total_gap = inner_gap * len_u16.saturating_sub(2);
+                            // There are (len - 1) inner gaps
+                            let total_gap = inner_gap * len_u16.saturating_sub(1);
 
                             let used_area = area.width.saturating_sub(total_gap);
-                            let width = used_area / len_u16;
+
+                            let slots = container.calculate_slots_width();
+                            let slot_width: f32 = used_area as f32 / slots as f32;
+
+                            // Pre-compute child widths using floor, then distribute remaining pixels fairly
+                            let mut base_widths: Vec<u16> = Vec::with_capacity(len);
+                            let mut sum_widths: u16 = 0;
+                            for i in 0..len {
+                                let bounds = container.node_bounds[i];
+                                let w = match bounds.expand {
+                                    true => (40.0 * slot_width).floor() as u16,
+                                    false => (slot_width * bounds.width as f32).floor() as u16,
+                                };
+                                base_widths.push(w);
+                                sum_widths = sum_widths.saturating_add(w);
+                            }
+
+                            let mut remaining: u16 = used_area.saturating_sub(sum_widths);
+                            let mut widths = base_widths;
+                            // Distribute the remainder from left to right to avoid biasing the last pane
+                            let mut idx = 0usize;
+                            while remaining > 0 && len > 0 {
+                                widths[idx] = widths[idx].saturating_add(1);
+                                remaining -= 1;
+                                idx += 1;
+                                if idx >= len {
+                                    idx = 0;
+                                }
+                            }
 
                             let mut child_x = area.x;
-
                             for (i, child) in container.children.iter().enumerate() {
+                                let width = widths[i];
                                 let mut area = Rect::new(
                                     child_x,
                                     container.area.y,
                                     width,
                                     container.area.height,
                                 );
-                                child_x += width + inner_gap;
 
-                                // last child takes the remaining width because we can get uneven
-                                // space from rounding
+                                // Advance x; add inner gap only between children
+                                if i < len - 1 {
+                                    child_x = child_x.saturating_add(width + inner_gap);
+                                } else {
+                                    child_x = child_x.saturating_add(width);
+                                }
+
+                                // Ensure last child takes any 1px drift due to rounding
                                 if i == len - 1 {
                                     area.width = container.area.x + container.area.width - area.x;
                                 }
@@ -594,6 +815,104 @@ impl Tree {
             };
             self.recalculate();
         }
+    }
+
+    fn get_active_node_bounds_mut(
+        &mut self,
+        expect_layout: Layout,
+    ) -> Option<&mut ContainerBounds> {
+        let mut focus = self.focus;
+        let mut parent = self.nodes[focus].parent;
+
+        // Parent expected to be container
+        if let Some(focused_layout) = match &self.nodes[parent].content {
+            Content::View(_) => unreachable!(),
+            Content::Container(node) => Some(node.layout),
+        } {
+            // if we want to make a width change and we have a `Horizontal` layout focused,
+            // alter the parent `Vertical` layout instead and vice versa
+            if focused_layout != expect_layout {
+                focus = parent;
+                parent = self.nodes[parent].parent;
+            }
+
+            if let Content::Container(node) = &mut self.nodes[parent].content {
+                return node.as_mut().get_child_by_view_id(focus);
+            };
+        }
+        None
+    }
+
+    pub fn resize_buffer(
+        &mut self,
+        resize_type: Resize,
+        dimension: Dimension,
+        config: &crate::editor::Config,
+    ) {
+        match dimension {
+            Dimension::Width => {
+                let terminal_width = self.area.width;
+                if let Some(bounds) = self.get_active_node_bounds_mut(Layout::Vertical) {
+                    match resize_type {
+                        Resize::Shrink => {
+                            if bounds.width > 1 {
+                                bounds.width -= 1;
+                            }
+                        }
+                        Resize::Grow => {
+                            let max_width = if config.max_panel_width == 0 {
+                                // Dynamic limit based on configurable percentage of terminal width
+                                (terminal_width as f32 * config.max_panel_width_percent) as usize
+                            } else {
+                                config.max_panel_width
+                            };
+
+                            if bounds.width < max_width {
+                                bounds.width += 1;
+                            }
+                        }
+                    };
+                    self.recalculate();
+                }
+            }
+            Dimension::Height => {
+                let terminal_height = self.area.height;
+                if let Some(bounds) = self.get_active_node_bounds_mut(Layout::Horizontal) {
+                    match resize_type {
+                        Resize::Shrink => {
+                            if bounds.height > 1 {
+                                bounds.height -= 1;
+                            }
+                        }
+                        Resize::Grow => {
+                            let max_height = if config.max_panel_height == 0 {
+                                // Dynamic limit based on configurable percentage of terminal height
+                                (terminal_height as f32 * config.max_panel_height_percent) as usize
+                            } else {
+                                config.max_panel_height
+                            };
+
+                            if bounds.height < max_height {
+                                bounds.height += 1;
+                            }
+                        }
+                    };
+                    self.recalculate();
+                }
+            }
+        }
+    }
+
+    pub fn toggle_focus_window(&mut self) {
+        if let Some(bounds) = self.get_active_node_bounds_mut(Layout::Horizontal) {
+            bounds.expand = !bounds.expand;
+        }
+
+        if let Some(bounds) = self.get_active_node_bounds_mut(Layout::Vertical) {
+            bounds.expand = !bounds.expand;
+        }
+
+        self.recalculate();
     }
 
     pub fn swap_split_in_direction(&mut self, direction: Direction) -> Option<()> {
@@ -927,9 +1246,9 @@ mod test {
         assert_eq!(3, tree.views().count());
         assert_eq!(
             vec![
+                tree_area_width / 3,
                 tree_area_width / 3 - 1, // gap here
                 tree_area_width / 3 - 1, // gap here
-                tree_area_width / 3
             ],
             tree.views()
                 .map(|(view, _)| view.area.width)
@@ -957,12 +1276,324 @@ mod test {
 
         assert_eq!(10, tree.views().count());
         assert_eq!(
-            std::iter::repeat_n(7, 9)
-                .chain(Some(8)) // Rounding in `recalculate`.
+            std::iter::once(8) // Rounding in `recalculate`.
+                .chain(std::iter::repeat_n(7, 9))
                 .collect::<Vec<_>>(),
             tree.views()
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Helper to create a tree with `count` views in the given layout.
+    /// Returns the tree and a Vec of ViewIds in creation order.
+    fn make_tree(area: Rect, layout: Layout, count: usize) -> (Tree, Vec<ViewId>) {
+        let mut tree = Tree::new(area);
+        let mut ids = Vec::new();
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.insert(view);
+        ids.push(tree.focus);
+        for _ in 1..count {
+            let view = View::new(DocumentId::default(), GutterConfig::default());
+            tree.split(view, layout);
+            ids.push(tree.focus);
+        }
+        (tree, ids)
+    }
+
+    /// Helper to check that all views have approximately the same value in a
+    /// given dimension, allowing at most 1px difference from rounding.
+    fn assert_approx_equal(widths: &[u16]) {
+        let min = *widths.iter().min().unwrap();
+        let max = *widths.iter().max().unwrap();
+        assert!(
+            max - min <= 1,
+            "expected widths within 1px of each other, got {:?}",
+            widths
+        );
+    }
+
+    #[test]
+    fn remove_middle_of_three_flat_vertical_splits() {
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 3);
+
+        assert_eq!(tree.views().count(), 3);
+        tree.focus = ids[1];
+        tree.remove(ids[1]);
+
+        assert_eq!(tree.views().count(), 2);
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        // Each view should get roughly half the total width minus gaps.
+        // Total gap for 2 vertical children = 1px.
+        // Used area = 180 - 1 = 179. Each gets ~89-90.
+        assert!(widths[0] + widths[1] + 1 == width);
+        // Focus must be on a surviving view.
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_first_of_three_flat_vertical_splits() {
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 3);
+
+        tree.focus = ids[0];
+        tree.remove(ids[0]);
+
+        assert_eq!(tree.views().count(), 2);
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        assert!(widths[0] + widths[1] + 1 == width);
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_last_of_three_flat_vertical_splits() {
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 3);
+
+        tree.focus = ids[2];
+        tree.remove(ids[2]);
+
+        assert_eq!(tree.views().count(), 2);
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        assert!(widths[0] + widths[1] + 1 == width);
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_middle_of_three_flat_horizontal_splits() {
+        let (area, height) = (Rect::new(0, 0, 180, 80), 80);
+        let (mut tree, ids) = make_tree(area, Layout::Horizontal, 3);
+
+        assert_eq!(tree.views().count(), 3);
+        tree.focus = ids[1];
+        tree.remove(ids[1]);
+
+        assert_eq!(tree.views().count(), 2);
+        let heights: Vec<u16> = tree.views().map(|(v, _)| v.area.height).collect();
+        assert_approx_equal(&heights);
+        // Horizontal layout has no gaps. Total height = 80.
+        assert!(heights[0] + heights[1] == height);
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_from_nested_same_layout_flattens() {
+        // Remove a view that causes merge-up, promoting a container whose
+        // layout matches its new parent.  The promoted container should be
+        // flattened so its children become direct children of the grandparent.
+        //
+        // Expected tree after construction:
+        //
+        // root(Vertical)
+        // ├── h_container(Horizontal)
+        // │   ├── v_container(Vertical)     ← same layout as root
+        // │   │   ├── V0
+        // │   │   └── V3
+        // │   └── V2
+        // └── V1
+        //
+        // After removing V2:
+        //   1. h_container has only v_container left → merge-up
+        //   2. v_container promoted to root → root = [v_container, V1]
+        //   3. v_container(Vertical) == root(Vertical) → flatten
+        //   4. root = [V0, V3, V1]
+        //
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let mut tree = Tree::new(area);
+
+        // Insert V0
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.insert(view);
+        let v0 = tree.focus;
+
+        // vsplit V1 → root(Vertical) = [V0, V1]
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+        let v1 = tree.focus;
+
+        // Focus V0, hsplit V2 → root = [h_container(H, [V0, V2]), V1]
+        tree.focus = v0;
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Horizontal);
+        let v2 = tree.focus;
+
+        // Focus V0, vsplit V3 → h_container = [v_container(V, [V0, V3]), V2]
+        tree.focus = v0;
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+        let v3 = tree.focus;
+
+        assert_eq!(tree.views().count(), 4);
+
+        // Remove V2.  h_container has only v_container left → merge-up.
+        // v_container(Vertical) promoted to root(Vertical) → flatten.
+        tree.focus = v2;
+        tree.remove(v2);
+
+        assert_eq!(tree.views().count(), 3);
+
+        // After flattening, root(Vertical) = [V0, V3, V1].
+        // Total gap for 3 vertical children = 2px.
+        // Used area = 178, each gets ~59-60.
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        assert!(
+            widths.iter().sum::<u16>() + 2 == width,
+            "total widths + gaps should equal area width, got {:?}",
+            widths
+        );
+        // All three surviving views should be present.
+        let remaining: Vec<ViewId> = tree.views().map(|(v, _)| v.id).collect();
+        assert!(remaining.contains(&v0));
+        assert!(remaining.contains(&v3));
+        assert!(remaining.contains(&v1));
+    }
+
+    #[test]
+    fn remove_does_not_flatten_different_layout_containers() {
+        // root(Vertical) -> [h_container(Horizontal, [V0, V1, V2]), V3]
+        //
+        // Construction:
+        let (area, _width) = (Rect::new(0, 0, 180, 80), 180);
+        let mut tree = Tree::new(area);
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.insert(view);
+        let v0 = tree.focus;
+
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+        let v3 = tree.focus;
+
+        // Focus V0, hsplit V1 → creates h_container(Horizontal, [V0, V1])
+        tree.focus = v0;
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        let v1 = tree.split(view, Layout::Horizontal);
+
+        // Focus V1, hsplit V2 → added to h_container (same layout)
+        tree.focus = v1;
+        let view = View::new(DocumentId::default(), GutterConfig::default());
+        tree.split(view, Layout::Horizontal);
+        let v2 = tree.focus;
+
+        assert_eq!(tree.views().count(), 4);
+
+        // Remove V1. h_container has 2 children left [V0, V2].
+        // h_container(Horizontal) != root(Vertical) → should NOT flatten.
+        tree.focus = v1;
+        tree.remove(v1);
+
+        assert_eq!(tree.views().count(), 3);
+
+        // root has 2 children: h_container and V3.
+        // Total gap = 1px, used area = 179. h_container gets ~90, V3 gets ~89.
+        let v3_view = tree.get(v3);
+        assert!(
+            v3_view.area.width == 89 || v3_view.area.width == 90,
+            "V3 should get roughly half the width, got {}",
+            v3_view.area.width
+        );
+
+        // V0 and V2 are stacked vertically inside h_container (no gaps).
+        // h_container height = 80, each gets 40.
+        let v0_view = tree.get(v0);
+        let v2_view = tree.get(v2);
+        assert_eq!(v0_view.area.height, 40);
+        assert_eq!(v2_view.area.height, 40);
+        assert_eq!(v0_view.area.y, 0);
+        assert_eq!(v2_view.area.y, 40);
+    }
+
+    #[test]
+    fn remove_middle_of_four_vertical_splits() {
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 4);
+
+        tree.focus = ids[1];
+        tree.remove(ids[1]);
+
+        assert_eq!(tree.views().count(), 3);
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        // Total gap for 3 children = 2px, used area = 178.
+        assert!(widths.iter().sum::<u16>() + 2 == width);
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_middle_of_five_vertical_splits() {
+        let (area, width) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 5);
+
+        tree.focus = ids[2];
+        tree.remove(ids[2]);
+
+        assert_eq!(tree.views().count(), 4);
+        let widths: Vec<u16> = tree.views().map(|(v, _)| v.area.width).collect();
+        assert_approx_equal(&widths);
+        // Total gap for 4 children = 3px, used area = 177.
+        assert!(widths.iter().sum::<u16>() + 3 == width);
+        assert!(ids.contains(&tree.focus));
+    }
+
+    #[test]
+    fn remove_focus_moves_to_remaining_view() {
+        let (area, _) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 3);
+
+        tree.focus = ids[1];
+        tree.remove(ids[1]);
+
+        // Focus must be on a surviving view, not the removed one.
+        assert_ne!(tree.focus, ids[1]);
+        assert!(tree.contains(tree.focus));
+        assert!(tree.try_get(tree.focus).is_some());
+    }
+
+    #[test]
+    fn remove_preserves_document_association() {
+        let (area, _) = (Rect::new(0, 0, 180, 80), 180);
+        let mut tree = Tree::new(area);
+
+        let doc_a = DocumentId::default();
+        let doc_b = DocumentId::default();
+        let doc_c = DocumentId::default();
+
+        let view = View::new(doc_a, GutterConfig::default());
+        tree.insert(view);
+        let v0 = tree.focus;
+
+        let view = View::new(doc_b, GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+        let v1 = tree.focus;
+
+        let view = View::new(doc_c, GutterConfig::default());
+        tree.split(view, Layout::Vertical);
+        let v2 = tree.focus;
+
+        // Remove the middle view.
+        tree.focus = v1;
+        tree.remove(v1);
+
+        // Remaining views must still reference their original documents.
+        assert_eq!(tree.get(v0).doc, doc_a);
+        assert_eq!(tree.get(v2).doc, doc_c);
+    }
+
+    #[test]
+    fn remove_single_view_tree_does_not_panic() {
+        let (area, _) = (Rect::new(0, 0, 180, 80), 180);
+        let (mut tree, ids) = make_tree(area, Layout::Vertical, 1);
+
+        assert_eq!(tree.views().count(), 1);
+        tree.remove(ids[0]);
+
+        // Tree should be empty; focus reset to root.
+        assert!(tree.is_empty());
+        assert_eq!(tree.focus, tree.root);
     }
 }

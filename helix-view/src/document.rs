@@ -12,7 +12,9 @@ use helix_core::encoding::Encoding;
 use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
 use helix_core::syntax::config::LanguageServerFeature;
 use helix_core::text_annotations::{InlineAnnotation, Overlay};
+use helix_core::text_folding::{EndFoldPoint, FoldContainer, StartFoldPoint};
 use helix_event::TaskController;
+use helix_lsp::lsp::DocumentSymbol;
 use helix_lsp::util::lsp_pos_to_pos;
 use helix_stdx::faccess::{copy_metadata, readonly};
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
@@ -138,6 +140,23 @@ pub enum DocumentOpenError {
     IoError(#[from] io::Error),
 }
 
+#[derive(Debug, Clone)]
+pub struct PluginAnnotation {
+    pub char_idx: usize,
+    pub text: String,
+    pub style: Option<String>,
+    pub fg: Option<String>,
+    pub bg: Option<String>,
+    pub offset: u16,
+    pub is_line: bool,
+    /// For virtual lines: which row index this belongs to (0-indexed).
+    /// Multiple annotations with the same virt_line_idx will render on the same virtual line.
+    pub virt_line_idx: Option<u16>,
+    /// Alternate text to use when this annotation is "dropped" to a virtual line
+    /// (e.g., elbow symbol instead of arrow for diagnostics on narrow terminals)
+    pub dropped_text: Option<String>,
+}
+
 pub struct Document {
     pub(crate) id: DocumentId,
     text: Rope,
@@ -151,6 +170,8 @@ pub struct Document {
     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
     /// Jump label overlays for each view.
     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+    pub plugin_annotations: HashMap<ViewId, Vec<PluginAnnotation>>,
+    fold_container: HashMap<ViewId, FoldContainer>,
     /// LSP document highlights for each view, stored as char ranges.
     pub(crate) document_highlights: HashMap<ViewId, DocumentHighlights>,
     /// LSP code action hints for each view.
@@ -158,6 +179,11 @@ pub struct Document {
     /// Set to `true` when the document is updated, reset to `false` on the next inlay hints
     /// update from the LSP
     pub inlay_hints_oudated: bool,
+
+    // Stores all the symbols of the Document.
+    pub(crate) symbols: Option<DocumentSymbolCache>,
+    /// Breadcrumb trail for each view showing this document.
+    pub breadcrumbs: HashMap<ViewId, Breadcrumbs>,
 
     path: Option<PathBuf>,
     relative_path: OnceCell<Option<PathBuf>>,
@@ -208,6 +234,10 @@ pub struct Document {
 
     diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
+    /// Contains blame information for each line in the file
+    /// We store the Result because when we access the blame manually we want to log the error
+    /// But if it is in the background we are just going to ignore the error
+    pub file_blame: Option<anyhow::Result<helix_vcs::FileBlame>>,
 
     // when document was used for most-recent-used buffer picker
     pub focused_at: std::time::Instant,
@@ -229,7 +259,12 @@ pub struct Document {
     pub code_action_controllers: HashMap<ViewId, TaskController>,
     pub pull_diagnostic_controller: TaskController,
     pub document_link_controller: TaskController,
+    pub document_symbols_controller: TaskController,
 
+    /// Whether to render the welcome screen when opening the document
+    pub is_welcome: bool,
+    /// When fetching blame on-demand, if this field is `true` we request the blame for this document again
+    pub is_blame_potentially_out_of_date: bool,
     // NOTE: this field should eventually go away - we should use the Editor's syn_loader instead
     // of storing a copy on every doc. Then we can remove the surrounding `Arc` and use the
     // `ArcSwap` directly.
@@ -241,6 +276,170 @@ pub struct DocumentColorSwatches {
     pub color_swatches: Vec<InlineAnnotation>,
     pub colors: Vec<syntax::Highlight>,
     pub color_swatches_padding: Vec<InlineAnnotation>,
+}
+
+pub struct DocumentSymbolCache {
+    pub tree: Vec<ThinDocumentSymbol>,
+    pub offset_encoding: OffsetEncoding,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThinDocumentSymbol {
+    pub name: Box<str>,
+    pub kind: lsp::SymbolKind,
+    pub range: lsp::Range,
+    pub children: Option<Box<[Self]>>,
+}
+
+impl From<DocumentSymbol> for ThinDocumentSymbol {
+    #[inline]
+    fn from(symbol: DocumentSymbol) -> Self {
+        Self {
+            name: symbol.name.into(),
+            kind: symbol.kind,
+            range: symbol.range,
+            children: symbol.children.map(|children| {
+                let mut vec = Vec::with_capacity(children.len());
+                vec.extend(children.into_iter().map(Self::from));
+                vec.into_boxed_slice()
+            }),
+        }
+    }
+}
+
+impl ThinDocumentSymbol {
+    fn contains(outer: &lsp::Range, inner: &lsp::Range) -> bool {
+        outer.start <= inner.start && inner.end <= outer.end
+    }
+
+    /// Build a hierarchy from a flat list of symbols (e.g. tree-sitter tags or
+    /// an LSP `DocumentSymbolResponse::Flat`) by nesting each symbol inside the
+    /// nearest preceding symbol whose range contains it.
+    pub fn nest_flat(mut symbols: Vec<Self>) -> Vec<Self> {
+        if symbols.is_empty() {
+            return symbols;
+        }
+
+        // Sort by start position; on ties the larger (outer) range first so
+        // that containment forms a proper tree.
+        symbols.sort_by(|a, b| {
+            a.range
+                .start
+                .cmp(&b.range.start)
+                .then_with(|| b.range.end.cmp(&a.range.end))
+        });
+
+        fn finish(
+            symbol: ThinDocumentSymbol,
+            children: Vec<ThinDocumentSymbol>,
+        ) -> ThinDocumentSymbol {
+            let mut symbol = symbol;
+            symbol.children = (!children.is_empty()).then(|| children.into_boxed_slice());
+            symbol
+        }
+
+        let mut roots: Vec<ThinDocumentSymbol> = Vec::new();
+        // Stack of symbols whose range contains every subsequently seen range,
+        // accumulating their children as they are discovered.
+        let mut stack: Vec<(ThinDocumentSymbol, Vec<ThinDocumentSymbol>)> = Vec::new();
+
+        for symbol in symbols {
+            loop {
+                match stack.last() {
+                    Some((top, _)) if Self::contains(&top.range, &symbol.range) => break,
+                    None => break,
+                    Some(_) => {}
+                }
+                let (sym, children) = stack.pop().expect("stack is non-empty here");
+                let sym = finish(sym, children);
+                match stack.last_mut() {
+                    Some((_, siblings)) => siblings.push(sym),
+                    None => roots.push(sym),
+                }
+            }
+            stack.push((symbol, Vec::new()));
+        }
+
+        while let Some((sym, children)) = stack.pop() {
+            let sym = finish(sym, children);
+            match stack.last_mut() {
+                Some((_, siblings)) => siblings.push(sym),
+                None => roots.push(sym),
+            }
+        }
+
+        roots
+    }
+}
+
+/// Breadcrumb trail of symbols leading to the cursor, outermost first.
+#[derive(Debug, Clone, Default)]
+pub struct Breadcrumbs {
+    crumbs: Vec<Crumb>,
+    /// Whether outermost symbols were dropped to honor `breadcrumb.max-depth`.
+    elided: bool,
+}
+
+impl Breadcrumbs {
+    #[inline]
+    pub fn push(&mut self, crumb: Crumb) {
+        self.crumbs.push(crumb);
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.crumbs.clear();
+        self.elided = false;
+    }
+
+    /// Drop the outermost symbols beyond `max_depth`, marking the trail as elided.
+    #[inline]
+    pub fn truncate_depth(&mut self, max_depth: usize) {
+        if max_depth != 0 && self.crumbs.len() > max_depth {
+            let excess = self.crumbs.len() - max_depth;
+            self.crumbs.drain(0..excess);
+            self.elided = true;
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.crumbs.is_empty()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.crumbs.len()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn elided(&self) -> bool {
+        self.elided
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = &Crumb> {
+        self.crumbs.iter()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Crumb {
+    pub name: Box<str>,
+    pub kind: lsp::SymbolKind,
+}
+
+impl From<&ThinDocumentSymbol> for Crumb {
+    #[inline]
+    fn from(symbol: &ThinDocumentSymbol) -> Self {
+        Self {
+            name: symbol.name.clone(),
+            kind: symbol.kind,
+        }
+    }
 }
 
 /// Highlight ranges returned by LSP `textDocument/documentHighlight` for a view.
@@ -325,6 +524,16 @@ pub struct DocumentInlayHintsId {
     pub last_line: usize,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum LineBlameError<'a> {
+    #[error("Not committed yet")]
+    NotCommittedYet,
+    #[error("Unable to get blame for line {0}: {1}")]
+    NoFileBlame(u32, &'a anyhow::Error),
+    #[error("The blame for this file is not ready yet. Try again in a few seconds")]
+    NotReadyYet,
+}
+
 use std::{fmt, mem};
 impl fmt::Debug for Document {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -349,6 +558,7 @@ impl fmt::Debug for Document {
             .field("modified_since_accessed", &self.modified_since_accessed)
             .field("diagnostics", &self.diagnostics)
             // .field("language_server", &self.language_server)
+            .field("fold_container", &self.fold_container)
             .finish()
     }
 }
@@ -715,7 +925,7 @@ where
     *mut_ref = f(mem::take(mut_ref));
 }
 
-use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName};
+use helix_lsp::{lsp, Client, LanguageServerId, LanguageServerName, OffsetEncoding};
 use helix_stdx::Url;
 
 impl Document {
@@ -741,6 +951,7 @@ impl Document {
             text,
             selections: HashMap::default(),
             inlay_hints: HashMap::default(),
+            fold_container: HashMap::default(),
             inlay_hints_oudated: false,
             view_data: Default::default(),
             indent_style: DEFAULT_INDENT,
@@ -765,17 +976,32 @@ impl Document {
             focused_at: std::time::Instant::now(),
             readonly: false,
             jump_labels: HashMap::new(),
+            plugin_annotations: HashMap::new(),
             document_highlights: HashMap::new(),
             code_action_hints: HashSet::new(),
             color_swatches: None,
             document_links: Vec::new(),
             color_swatch_controller: TaskController::new(),
+            is_welcome: false,
+            file_blame: None,
+            is_blame_potentially_out_of_date: false,
             document_highlight_controllers: HashMap::new(),
             code_action_controllers: HashMap::new(),
             syn_loader,
             previous_diagnostic_ids: HashMap::new(),
             pull_diagnostic_controller: TaskController::new(),
             document_link_controller: TaskController::new(),
+            symbols: None,
+            document_symbols_controller: TaskController::new(),
+            breadcrumbs: HashMap::new(),
+        }
+    }
+
+    pub fn should_request_full_file_blame(&mut self, auto_fetch: bool) -> bool {
+        if auto_fetch {
+            true
+        } else {
+            self.is_blame_potentially_out_of_date
         }
     }
 
@@ -786,6 +1012,11 @@ impl Document {
         let line_ending: LineEnding = config.load().default_line_ending.into();
         let text = Rope::from(line_ending.as_str());
         Self::from(text, None, config, syn_loader)
+    }
+
+    pub fn with_welcome(mut self) -> Self {
+        self.is_welcome = true;
+        self
     }
 
     // TODO: async fn?
@@ -1269,6 +1500,11 @@ impl Document {
         };
     }
 
+    /// Return the last saved time of the document.
+    pub fn get_last_saved_time(&self) -> SystemTime {
+        self.last_saved_time
+    }
+
     // Detect if the file is readonly and change the readonly field if necessary (unix only)
     pub fn detect_readonly(&mut self) {
         // Allows setting the flag for files the user cannot modify, like root files
@@ -1397,6 +1633,15 @@ impl Document {
         // TODO: use a transaction?
         self.selections
             .insert(view_id, selection.ensure_invariants(self.text().slice(..)));
+
+        if let Some((container, selection)) = self
+            .fold_container
+            .get_mut(&view_id)
+            .zip(self.selections.get(&view_id))
+        {
+            container.remove_by_selection(self.text.slice(..), selection)
+        }
+
         helix_event::dispatch(SelectionDidChange {
             doc: self,
             view: view_id,
@@ -1414,6 +1659,13 @@ impl Document {
         Range::new(0, 1).grapheme_aligned(self.text().slice(..))
     }
 
+    /// Get the line of cursor for the primary selection
+    pub fn cursor_line(&self, view_id: ViewId) -> usize {
+        let text = self.text();
+        let selection = self.selection(view_id);
+        text.char_to_line(selection.primary().cursor(text.slice(..)))
+    }
+
     /// Reset the view's selection on this document to the
     /// [origin](Document::origin) cursor.
     pub fn reset_selection(&mut self, view_id: ViewId) {
@@ -1429,6 +1681,10 @@ impl Document {
         }
 
         self.view_data_mut(view_id);
+
+        if self.config.load().breadcrumb.enable {
+            self.update_breadcrumbs_for_view(view_id);
+        }
     }
 
     /// Mark document as recent used for MRU sorting
@@ -1442,6 +1698,7 @@ impl Document {
         self.view_data.remove(&view_id);
         self.inlay_hints.remove(&view_id);
         self.jump_labels.remove(&view_id);
+        self.breadcrumbs.remove(&view_id);
         self.document_highlights.remove(&view_id);
         self.document_highlight_controllers.remove(&view_id);
         self.code_action_hints.remove(&view_id);
@@ -1465,14 +1722,10 @@ impl Document {
 
         if changes.is_empty() {
             if let Some(selection) = transaction.selection() {
-                self.selections.insert(
+                self.set_selection(
                     view_id,
                     selection.clone().ensure_invariants(self.text.slice(..)),
                 );
-                helix_event::dispatch(SelectionDidChange {
-                    doc: self,
-                    view: view_id,
-                });
             }
             return true;
         }
@@ -1480,13 +1733,23 @@ impl Document {
         self.modified_since_accessed = true;
         self.version += 1;
 
-        for selection in self.selections.values_mut() {
-            *selection = selection
+        for container in self.fold_container.values_mut() {
+            container.update_by_transaction(self.text.slice(..), old_doc.slice(..), transaction);
+        }
+
+        for (id, selection) in &mut self.selections {
+            let ensured_selection = selection
                 .clone()
                 // Map through changes
                 .map(transaction.changes())
                 // Ensure all selections across all views still adhere to invariants.
                 .ensure_invariants(self.text.slice(..));
+
+            if let Some(container) = self.fold_container.get_mut(id) {
+                container.remove_by_selection(self.text.slice(..), &ensured_selection);
+            }
+
+            *selection = ensured_selection;
         }
 
         for view_data in self.view_data.values_mut() {
@@ -1502,6 +1765,9 @@ impl Document {
                 .retain_mut(|save_point| match save_point.upgrade() {
                     Some(savepoint) => {
                         let mut revert_to_savepoint = savepoint.revert.lock();
+                        if revert.changes().len_after() != revert_to_savepoint.changes().len() {
+                            return true;
+                        }
                         *revert_to_savepoint =
                             revert.clone().compose(mem::take(&mut revert_to_savepoint));
                         true
@@ -1629,14 +1895,10 @@ impl Document {
 
         // if specified, the current selection should instead be replaced by transaction.selection
         if let Some(selection) = transaction.selection() {
-            self.selections.insert(
+            self.set_selection(
                 view_id,
                 selection.clone().ensure_invariants(self.text.slice(..)),
             );
-            helix_event::dispatch(SelectionDidChange {
-                doc: self,
-                view: view_id,
-            });
         }
 
         true
@@ -1659,10 +1921,30 @@ impl Document {
 
         let success = self.apply_impl(transaction, view_id, emit_lsp_notification);
 
-        if !transaction.changes().is_empty() {
-            // Compose this transaction with the previous one
+        if success && !transaction.changes().is_empty() {
+            // Compose this transaction with the previous one.
+            // We handle recursion by checking if the existing changes happened
+            // BEFORE or AFTER this one.
             take_with(&mut self.changes, |changes| {
-                changes.compose(transaction.changes().clone())
+                if changes.is_empty() {
+                    return transaction.changes().clone();
+                }
+
+                // If transaction's after matches changes' before, it's normal sequential.
+                if changes.len_after() == transaction.changes().len() {
+                    return changes.compose(transaction.changes().clone());
+                }
+
+                // If transaction's after matches current changes' before,
+                // transaction is L0 -> L1, current is L1 -> L2.
+                // It means this transaction happened logically first (recursion).
+                if transaction.changes().len_after() == changes.len() {
+                    return transaction.changes().clone().compose(changes);
+                }
+
+                // Fallback: something is wrong (mismatch), keep current to avoid panic.
+                log::warn!("Composition skipped due to unexpected length mismatch: prev_after={}, txn_before={}, txn_after={}, curr_len={}", changes.len_after(), transaction.changes().len(), transaction.changes().len_after(), changes.len());
+                changes
             });
         }
         success
@@ -1670,6 +1952,60 @@ impl Document {
     /// Apply a [`Transaction`] to the [`Document`] to change its text.
     pub fn apply(&mut self, transaction: &Transaction, view_id: ViewId) -> bool {
         self.apply_inner(transaction, view_id, true)
+    }
+
+    /// Get the line blame for this view
+    pub fn line_blame(&self, cursor_line: u32, format: &str) -> Result<String, LineBlameError<'_>> {
+        // how many lines were inserted and deleted before the cursor line
+        let (inserted_lines, deleted_lines) = self
+            .diff_handle()
+            .map_or(
+                // in theory there can be situations where we don't have the diff for a file
+                // but we have the blame. In this case, we can just act like there is no diff
+                Some((0, 0)),
+                |diff_handle| {
+                    // Compute the amount of lines inserted and deleted before the `line`
+                    // This information is needed to accurately transform the state of the
+                    // file in the file system into what gix::blame knows about (gix::blame only
+                    // knows about commit history, it does not know about uncommitted changes)
+                    diff_handle
+                        .try_load()?
+                        .hunks_intersecting_line_ranges(std::iter::once((0, cursor_line as usize)))
+                        .try_fold(
+                            (0, 0),
+                            |(total_inserted_lines, total_deleted_lines), hunk| {
+                                // check if the line intersects the hunk's `after` (which represents
+                                // inserted lines)
+                                (hunk.after.start > cursor_line || hunk.after.end <= cursor_line)
+                                    .then_some((
+                                        total_inserted_lines + (hunk.after.end - hunk.after.start),
+                                        total_deleted_lines + (hunk.before.end - hunk.before.start),
+                                    ))
+                            },
+                        )
+                },
+            )
+            .ok_or(LineBlameError::NotCommittedYet)?;
+
+        let file_blame = match &self.file_blame {
+            None => return Err(LineBlameError::NotReadyYet),
+            Some(result) => match result {
+                Err(err) => {
+                    return Err(LineBlameError::NoFileBlame(
+                        // convert 0-based line into 1-based line
+                        cursor_line.saturating_add(1),
+                        err,
+                    ));
+                }
+                Ok(file_blame) => file_blame,
+            },
+        };
+
+        let line_blame = file_blame
+            .blame_for_line(cursor_line, inserted_lines, deleted_lines)
+            .parse_format(format);
+
+        Ok(line_blame)
     }
 
     /// Apply a [`Transaction`] to the [`Document`] to change its text
@@ -2389,10 +2725,6 @@ impl Document {
             .and_then(|soft_wrap| soft_wrap.max_indent_retain)
             .or(editor_soft_wrap.max_indent_retain)
             .unwrap_or(40);
-        let wrap_indicator = language_soft_wrap
-            .and_then(|soft_wrap| soft_wrap.wrap_indicator.clone())
-            .or_else(|| config.soft_wrap.wrap_indicator.clone())
-            .unwrap_or_else(|| "↪ ".into());
         let tab_width = self.tab_width() as u16;
         TextFormat {
             soft_wrap: enable_soft_wrap && viewport_width > 10,
@@ -2402,7 +2734,6 @@ impl Document {
             // avoid spinning forever when the window manager
             // sets the size to something tiny
             viewport_width,
-            wrap_indicator: wrap_indicator.into_boxed_str(),
             wrap_indicator_highlight: theme
                 .and_then(|theme| theme.find_highlight("ui.virtual.wrap")),
             soft_wrap_at_text_width,
@@ -2420,6 +2751,121 @@ impl Document {
 
     pub fn remove_jump_labels(&mut self, view_id: ViewId) {
         self.jump_labels.remove(&view_id);
+    }
+
+    #[inline]
+    pub fn set_document_symbols(
+        &mut self,
+        symbols: Vec<DocumentSymbol>,
+        offset_encoding: OffsetEncoding,
+    ) {
+        self.symbols = Some(DocumentSymbolCache {
+            tree: symbols.into_iter().map(ThinDocumentSymbol::from).collect(),
+            offset_encoding,
+        });
+    }
+
+    /// Store a pre-built symbol tree (used by the tree-sitter fallback).
+    #[inline]
+    pub fn set_symbol_tree(
+        &mut self,
+        tree: Vec<ThinDocumentSymbol>,
+        offset_encoding: OffsetEncoding,
+    ) {
+        self.symbols = Some(DocumentSymbolCache {
+            tree,
+            offset_encoding,
+        });
+    }
+
+    #[inline]
+    pub fn clear_document_symbols(&mut self) {
+        self.symbols = None;
+        self.clear_breadcrumbs();
+    }
+
+    #[inline]
+    pub fn clear_breadcrumbs(&mut self) {
+        self.breadcrumbs.clear();
+    }
+
+    // For all non-hotpaths, we use this function to prevent code bloat.
+    #[inline(never)]
+    pub fn update_breadcrumbs_for_view(&mut self, view_id: ViewId) {
+        self.update_breadcrumbs_for_view_inlined(view_id);
+    }
+
+    // We want to make sure this is inlined in the hotpath (cursor position change).
+    #[inline(always)]
+    pub fn update_breadcrumbs_for_view_inlined(&mut self, view_id: ViewId) {
+        #[inline(always)]
+        const fn in_range(pos: lsp::Position, range: lsp::Range) -> bool {
+            // PERF:
+            // Line-based filtering is the most effective early exit indicator,
+            // so do first, before other evaluations; this should be friendly to
+            // the CPU branch predictor.
+            if pos.line < range.start.line || pos.line > range.end.line {
+                return false;
+            }
+
+            // Check if the cursor position is "in" the symbols "depth".
+            //
+            // In the context of breadcrumbs, this would be the difference between
+            // if the cursor is in an impl block or in an impl block and in a
+            // function of the impl block (`|` is the cursor):
+            //
+            // ```rust
+            // impl Foo {
+            //     f|n bar() {} // In `bar`: impl Foo > bar
+            //
+            //   | fn baz() {} // Not in `baz`: impl Foo
+            //
+            //     fn quux() {} | // Not in `quux`: impl Foo
+            // }
+            // ```
+            if pos.line == range.start.line && pos.character < range.start.character {
+                return false;
+            }
+            if pos.line == range.end.line && pos.character > range.end.character {
+                return false;
+            }
+
+            true
+        }
+
+        let Some(symbols) = self.symbols.as_ref() else {
+            return;
+        };
+
+        // The view may not have been initialized for this document yet.
+        if !self.selections.contains_key(&view_id) {
+            return;
+        }
+
+        let position = self.position(view_id, symbols.offset_encoding);
+
+        let max_depth = self.config.load().breadcrumb.max_depth;
+
+        let breadcrumb = {
+            let breadcrumb = self.breadcrumbs.entry(view_id).or_default();
+            breadcrumb.clear();
+            breadcrumb
+        };
+
+        let mut current = symbols.tree.as_slice();
+
+        while let Some(symbol) = current
+            .iter()
+            .find(|&symbol| in_range(position, symbol.range))
+        {
+            breadcrumb.push(Crumb::from(symbol));
+            match symbol.children.as_deref() {
+                Some(children) => current = children,
+                _ => break,
+            }
+        }
+
+        breadcrumb.truncate_depth(max_depth);
     }
 
     pub fn set_document_highlights(
@@ -2490,6 +2936,59 @@ impl Document {
 
     pub fn has_language_server_with_feature(&self, feature: LanguageServerFeature) -> bool {
         self.language_servers_with_feature(feature).next().is_some()
+    }
+
+    pub fn insert_fold_container(&mut self, view_id: ViewId, container: FoldContainer) {
+        self.fold_container.insert(view_id, container);
+    }
+
+    /// `None` when container is empty.
+    pub fn fold_container(&self, view_id: ViewId) -> Option<&FoldContainer> {
+        self.fold_container.get(&view_id)
+    }
+
+    fn add_folds_impl(
+        &mut self,
+        view: &View,
+        fold_points: Vec<(StartFoldPoint, EndFoldPoint)>,
+        replace: bool,
+    ) {
+        let text = self.text.slice(..);
+        let range = self.selection(view.id).primary();
+        let container = self.fold_container.entry(view.id).or_default();
+
+        if replace {
+            container.replace(text, fold_points);
+        } else {
+            container.add(text, fold_points);
+        }
+
+        let range = container.throw_range_out_of_folds(text, range);
+        self.set_selection(view.id, Selection::single(range.anchor, range.head));
+
+        let scrolloff = self.config.load().scrolloff;
+        view.ensure_cursor_in_view(self, scrolloff);
+    }
+
+    pub fn add_folds(&mut self, view: &View, fold_points: Vec<(StartFoldPoint, EndFoldPoint)>) {
+        self.add_folds_impl(view, fold_points, false);
+    }
+
+    pub fn replace_folds(&mut self, view: &View, fold_points: Vec<(StartFoldPoint, EndFoldPoint)>) {
+        self.add_folds_impl(view, fold_points, true);
+    }
+
+    pub fn remove_folds(&mut self, view: &View, start_indices: Vec<usize>) {
+        let text = self.text.slice(..);
+        let container = self
+            .fold_container
+            .get_mut(&view.id)
+            .expect("Container must be initialized");
+
+        container.remove(text, start_indices);
+
+        let scrolloff = self.config.load().scrolloff;
+        view.ensure_cursor_in_view(self, scrolloff);
     }
 }
 
@@ -2768,4 +3267,116 @@ mod test {
     decode!(jis0212_decode, "jis0212", "EUC-JP");
     decode!(shift_jis_decode, "shift_jis");
     encode!(shift_jis_encode, "shift_jis");
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::{Breadcrumbs, Crumb, ThinDocumentSymbol};
+    use helix_lsp::lsp;
+
+    fn symbol(name: &str, start: (u32, u32), end: (u32, u32)) -> ThinDocumentSymbol {
+        ThinDocumentSymbol {
+            name: name.into(),
+            kind: lsp::SymbolKind::FUNCTION,
+            range: lsp::Range {
+                start: lsp::Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: lsp::Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            },
+            children: None,
+        }
+    }
+
+    #[test]
+    fn nest_flat_builds_hierarchy_by_containment() {
+        // mod a { fn b() { } }  fn c() {}
+        let flat = vec![
+            symbol("c", (1, 0), (1, 8)),
+            symbol("b", (0, 9), (0, 15)),
+            symbol("a", (0, 0), (0, 18)),
+        ];
+
+        let tree = ThinDocumentSymbol::nest_flat(flat);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].name.as_ref(), "a");
+        let children = tree[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name.as_ref(), "b");
+        assert!(children[0].children.is_none());
+        assert_eq!(tree[1].name.as_ref(), "c");
+    }
+
+    #[test]
+    fn nest_flat_prefers_outer_range_on_tie() {
+        // Two symbols starting at the same position: the wider one is the parent.
+        let flat = vec![
+            symbol("inner", (0, 0), (0, 5)),
+            symbol("outer", (0, 0), (0, 9)),
+        ];
+
+        let tree = ThinDocumentSymbol::nest_flat(flat);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name.as_ref(), "outer");
+        assert_eq!(tree[0].children.as_ref().unwrap()[0].name.as_ref(), "inner");
+    }
+
+    #[test]
+    fn truncate_depth_keeps_deepest_and_marks_elided() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+        assert!(!crumbs.elided());
+
+        crumbs.truncate_depth(3);
+
+        assert!(crumbs.elided());
+        assert_eq!(crumbs.depth(), 3);
+        let names: Vec<_> = crumbs.iter().map(|c| &*c.name).collect();
+        assert_eq!(names, ["s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn truncate_depth_zero_is_unlimited() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+
+        crumbs.truncate_depth(0);
+
+        assert!(!crumbs.elided());
+        assert_eq!(crumbs.depth(), 5);
+    }
+
+    #[test]
+    fn clear_resets_elided_flag() {
+        let mut crumbs = Breadcrumbs::default();
+        for i in 0..5 {
+            crumbs.push(Crumb {
+                name: format!("s{i}").into(),
+                kind: lsp::SymbolKind::FUNCTION,
+            });
+        }
+        crumbs.truncate_depth(2);
+        assert!(crumbs.elided());
+
+        crumbs.clear();
+
+        assert!(!crumbs.elided());
+        assert!(crumbs.is_empty());
+    }
 }

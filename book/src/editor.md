@@ -1,6 +1,7 @@
 ## Editor
 
 - [`[editor]` Section](#editor-section)
+- [`[editor.breadcrumb]` Section](#editorbreadcrumb-section)
 - [`[editor.clipboard-provider]` Section](#editorclipboard-provider-section)
 - [`[editor.statusline]` Section](#editorstatusline-section)
 - [`[editor.lsp]` Section](#editorlsp-section)
@@ -9,6 +10,7 @@
 - [`[editor.file-explorer]` Section](#editorfile-explorer-section)
 - [`[editor.buffer-picker]` Section](#editorbuffer-picker-section)
 - [`[editor.auto-pairs]` Section](#editorauto-pairs-section)
+- [`[editor.auto-reload]` Section](#editorauto-reload-section)
 - [`[editor.auto-save]` Section](#editorauto-save-section)
 - [`[editor.search]` Section](#editorsearch-section)
 - [`[editor.whitespace]` Section](#editorwhitespace-section)
@@ -23,13 +25,14 @@
 - [`[editor.smart-tab]` Section](#editorsmart-tab-section)
 - [`[editor.inline-diagnostics]` Section](#editorinline-diagnostics-section)
 - [`[editor.word-completion]` Section](#editorword-completion-section)
+- [`[editor.completion-highlight]` Section](#editorcompletion-highlight-section)
+- [`[editor.scrolloff]` Section](#editorscrolloff-section)
 - [`[editor.workspace-trust]` Section](#editorworkspace-trust-section)
 
 ### `[editor]` Section
 
 | Key | Description | Default |
 |--|--|---------|
-| `scrolloff` | Number of lines of padding around the edge of the screen when scrolling | `5` |
 | `mouse` | Enable mouse mode | `true` |
 | `mouse-yank-register` | Which register to use for mouse yanks. | `*` |
 | `middle-click-paste` | Middle click paste support | `true` |
@@ -72,6 +75,39 @@
 | `kitty-keyboard-protocol` | Whether to enable Kitty Keyboard Protocol. Can be `enabled`, `disabled` or `auto` | `"auto"` |
 
 [^3]: In most cases, you also need to enable the `auto-format` setting under `languages.toml`. You can find the reasoning [here](https://github.com/helix-editor/helix/discussions/9043#discussioncomment-7811497).
+
+### `[editor.breadcrumb]` Section
+
+Allows configuration of the breadcrumb navigation bar.
+
+|       Setting        |                                   Description                                    | Default |
+|----------------------|----------------------------------------------------------------------------------|---------|
+| `enable`             | Whether to enable the breadcrumb navigation bar                                  | `false` |
+| `path`               | Selecting how much path information is shown                                     | `"full"`|
+| `max-depth`          | Maximum number of symbol levels shown; `0` means unlimited                       | `8`     |
+| `max-name-length`    | Maximum length of a single symbol name, truncated in the middle; `0` unlimited   | `32`    |
+
+```toml
+[editor.breadcrumb]
+enable = true
+# full: helix-term > src > commands > typed.rs > TypeableCommand > name
+# file: typed.rs > TypeableCommand > name
+# none: TypeableCommand > name
+path = "full|file|none"
+max-depth = 8
+max-name-length = 32
+```
+
+The bar is displayed at the top of the view.
+
+The symbol trail comes from the first language server that supports document
+symbols. When no such language server is available (or it only returns a flat
+symbol list), the trail is derived from tree-sitter tag queries (`tags.scm`)
+instead. When more symbols are nested than `max-depth`, the outermost symbols
+are elided with a leading `…`.
+
+If icon support is enabled via `[icons.kind]`, an icon is shown before each
+symbol name.
 
 ### `[editor.clipboard-provider]` Section
 
@@ -310,6 +346,16 @@ name = "rust"
 '<' = '>'
 ```
 
+### `[editor.auto-reload]` Section
+
+Controls auto reloading of externally modified files.
+
+| Key | Description | Default |
+|--|--|---------|
+| `focus-gained` | Enable automatic reloading of externally modified files when Helix is focused. Requires [focus event support](https://github.com/helix-editor/helix/wiki/Terminal-Support) from your terminal | `false` |
+| `periodic.enable` | Enable periodic auto reloading of externally modified files | `false` |
+| `periodic.interval` | Time interval in milliseconds between auto reload checks | `3000` |
+
 ### `[editor.auto-save]` Section
 
 Control auto save behavior.
@@ -538,6 +584,38 @@ enable = true
 trigger-length = 4
 ```
 
+### `[editor.completion-highlight]` Section
+
+Option for different coloring of completions
+
+| Key                  | Description                                                                              | Default  |
+| ---                  | ---                                                                                      | ---      |
+| `highlight-type`     | What kind completion highlighting we will display ("default", "theme-colors", "vibrant") | `default`|
+
+Example:
+
+```toml
+[editor.completion-highlight]
+highlight-type = "vibrant"
+```
+
+### `[editor.scrolloff]` Section
+
+Options for setting scrolloff shown below
+
+
+| Key        | Description | Default |
+|------------|-------------|---------|
+| `vertical` | Number of lines of padding around the top and bottom of the screen when scrolling | `5` |
+| `horizontal` | Number of lines of padding around the left and right of the screen when scrolling | `5` |
+
+Settings the scrolloff to `999` for `vertical` will center the line with the cursor.
+```toml
+[editor.scrolloff]
+vertical = 5
+horizontal = 5
+```
+
 ### `[editor.workspace-trust]` Section
 
 Controls implicit workspace trust. See the [workspace
@@ -566,3 +644,20 @@ level = "servers"
 # under a matching path. `~` and environment variables are expanded.
 trusted = ["~/src/github.com/me/*"]
 ```
+
+### `[editor.persistence]` Section
+
+Options for persisting editor state between sessions.
+
+The state is formatted with bincode, and stored in files in the state directory (`~/.local/state/helix` on Unix, `~\Local Settings\Application Data\helix\state` on Windows). You can reset your persisted state (and recover from any corruption) by deleting these files.
+
+| Key | Description | Default |
+| --- | ----------- | ------- |
+| `old-files` | whether to persist file locations between sessions ( when you reopen the a file, it will open at the place you last closed it) | `false` |
+| `commands` | whether to persist command history between sessions | `false` |
+| `search` | whether to persist search history between sessions | `false` |
+| `clipboard` | whether to persist helix's internal clipboard between sessions | `false` |
+| `old-files-exclusions` | a list of regexes defining file paths to exclude from persistence | `[".*/\.git/.*", ".*/COMMIT_EDITMSG"]` |
+| `old-files-trim` | number of old-files entries to keep when helix trims the state files at startup | `100` |
+| `commands-trim` | number of command history entries to keep when helix trims the state files at startup | `100` |
+| `search-trim` | number of search history entries to keep when helix trims the state files at startup | `100` |

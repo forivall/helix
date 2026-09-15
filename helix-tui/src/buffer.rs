@@ -435,6 +435,9 @@ impl Buffer {
 
         if truncate_start {
             for _ in 0..graphemes.next().map(|(_, g)| g.width()).unwrap_or_default() {
+                if index >= self.content.len() {
+                    break;
+                }
                 self.content[index].set_symbol("…");
                 index += 1;
                 rendered_width += 1;
@@ -450,11 +453,19 @@ impl Buffer {
                 continue;
             }
 
+            // Bounds check before accessing content
+            if index >= self.content.len() {
+                break;
+            }
+
             self.content[index].set_symbol(s);
             self.content[index].set_style(style(byte_offset));
 
             // Reset following cells if multi-width (they would be hidden by the grapheme):
             for i in index + 1..index + grapheme_width {
+                if i >= self.content.len() {
+                    break;
+                }
                 self.content[i].reset();
             }
 
@@ -464,6 +475,9 @@ impl Buffer {
 
         if truncate_end {
             for _ in 0..width.saturating_sub(rendered_width) {
+                if index >= self.content.len() {
+                    break;
+                }
                 self.content[index].set_symbol("…");
                 index += 1;
             }
@@ -523,7 +537,9 @@ impl Buffer {
             }
         } else {
             let mut start_index = self.index_of(x, y);
-            let mut index = self.index_of(max_offset as u16, y);
+            let last_col = ((self.area.right() as usize).saturating_sub(1))
+                .min(width.saturating_add(x as usize).saturating_sub(1));
+            let mut index = self.index_of(last_col as u16, y) + 1;
 
             let content_width = string.width();
             let truncated = content_width > width;
@@ -564,9 +580,12 @@ impl Buffer {
         }
 
         let mut x_offset = x as usize;
-        let max_offset = min(self.area.right(), width.saturating_add(x));
+        let last_col = x
+            .saturating_add(width)
+            .saturating_sub(1)
+            .min(self.area.right().saturating_sub(1));
         let mut start_index = self.index_of(x, y);
-        let mut index = self.index_of(max_offset, y);
+        let mut index = self.index_of(last_col, y) + 1;
 
         let content_width = spans.width();
         let truncated = content_width > width as usize;
@@ -669,6 +688,8 @@ impl Buffer {
 
     /// Clear an area in the buffer
     pub fn clear(&mut self, area: Rect) {
+        // Clamp to buffer bounds to avoid out-of-bounds indexing
+        let area = self.area.intersection(area);
         for x in area.left()..area.right() {
             for y in area.top()..area.bottom() {
                 self[(x, y)].reset();
@@ -678,6 +699,8 @@ impl Buffer {
 
     /// Clear an area in the buffer with a default style.
     pub fn clear_with(&mut self, area: Rect, style: Style) {
+        // Clamp to buffer bounds to avoid out-of-bounds indexing
+        let area = self.area.intersection(area);
         for x in area.left()..area.right() {
             for y in area.top()..area.bottom() {
                 let cell = &mut self[(x, y)];

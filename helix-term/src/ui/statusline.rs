@@ -2,16 +2,19 @@ use helix_core::indent::IndentStyle;
 use helix_core::{coords_at_pos, encoding, unicode::width::UnicodeWidthStr, Position};
 use helix_lsp::lsp::DiagnosticSeverity;
 use helix_view::document::DEFAULT_LANGUAGE_NAME;
+use helix_view::icons::ICONS;
 use helix_view::{
     document::{Mode, SCRATCH_BUFFER_NAME},
     graphics::Rect,
     theme::Style,
-    Document, Editor, View,
+    Document, DocumentId, Editor, View, ViewId,
 };
 
 use crate::ui::ProgressSpinners;
 
+use helix_core::{tree_sitter::Node as TsNode, RopeSlice};
 use helix_view::editor::StatusLineElement as StatusLineElementID;
+use std::sync::{LazyLock, Mutex};
 use tui::buffer::Buffer as Surface;
 use tui::text::{Span, Spans};
 
@@ -158,6 +161,7 @@ where
         helix_view::editor::StatusLineElement::Register => render_register,
         helix_view::editor::StatusLineElement::CurrentWorkingDirectory => render_cwd,
         helix_view::editor::StatusLineElement::CodeActionHint => render_code_action_hint,
+        helix_view::editor::StatusLineElement::FunctionName => render_function_name,
     }
 }
 
@@ -232,29 +236,48 @@ where
                 counts
             });
 
+    let icons = ICONS.load();
     for sev in &context.editor.config().statusline.diagnostics {
         match sev {
             Severity::Hint if hints > 0 => {
-                write(context, Span::styled("●", context.editor.theme.get("hint")));
-                write(context, format!(" {} ", hints).into());
+                write(
+                    context,
+                    Span::styled(
+                        icons.diagnostic().hint().to_string(),
+                        context.editor.theme.get("hint"),
+                    ),
+                );
+                write(context, Span::raw(format!(" {hints} ")));
             }
             Severity::Info if info > 0 => {
-                write(context, Span::styled("●", context.editor.theme.get("info")));
-                write(context, format!(" {} ", info).into());
+                write(
+                    context,
+                    Span::styled(
+                        icons.diagnostic().info().to_string(),
+                        context.editor.theme.get("info"),
+                    ),
+                );
+                write(context, Span::raw(format!(" {info} ")));
             }
             Severity::Warning if warnings > 0 => {
                 write(
                     context,
-                    Span::styled("●", context.editor.theme.get("warning")),
+                    Span::styled(
+                        icons.diagnostic().warning().to_string(),
+                        context.editor.theme.get("warning"),
+                    ),
                 );
-                write(context, format!(" {} ", warnings).into());
+                write(context, Span::raw(format!(" {warnings} ")));
             }
             Severity::Error if errors > 0 => {
                 write(
                     context,
-                    Span::styled("●", context.editor.theme.get("error")),
+                    Span::styled(
+                        icons.diagnostic().error().to_string(),
+                        context.editor.theme.get("error"),
+                    ),
                 );
-                write(context, format!(" {} ", errors).into());
+                write(context, Span::raw(format!(" {errors} ")));
             }
             _ => {}
         }
@@ -285,10 +308,10 @@ where
         },
     );
 
-    let sevs_to_show = &context.editor.config().statusline.workspace_diagnostics;
+    let sevs = &context.editor.config().statusline.workspace_diagnostics;
 
-    // Avoid showing the " W " if no diagnostic counts will be shown.
-    if !sevs_to_show.iter().any(|sev| match sev {
+    // Avoid showing the ` W ` if no diagnostic counts will be shown.
+    if !sevs.iter().any(|sev| match sev {
         Severity::Hint => hints != 0,
         Severity::Info => info != 0,
         Severity::Warning => warnings != 0,
@@ -297,31 +320,66 @@ where
         return;
     }
 
-    write(context, " W ".into());
+    let icons = ICONS.load();
+    let icon = icons.kind().workspace();
 
-    for sev in sevs_to_show {
+    // NOTE: Special case when the `workspace` key is set to `""`:
+    //
+    // ```
+    // [icons.kind]
+    // workspace = ""
+    // ```
+    //
+    // This will remove the default ` W ` so that the rest of the icons are spaced correctly.
+    if !icon.glyph().is_empty() {
+        if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+            write(context, Span::styled(format!("{} ", icon.glyph()), style));
+        } else {
+            write(context, format!("{} ", icon.glyph()).into());
+        }
+    }
+
+    for sev in sevs {
         match sev {
             Severity::Hint if hints > 0 => {
-                write(context, Span::styled("●", context.editor.theme.get("hint")));
-                write(context, format!(" {} ", hints).into());
+                write(
+                    context,
+                    Span::styled(
+                        icons.diagnostic().hint().to_string(),
+                        context.editor.theme.get("hint"),
+                    ),
+                );
+                write(context, Span::raw(format!(" {hints} ")));
             }
             Severity::Info if info > 0 => {
-                write(context, Span::styled("●", context.editor.theme.get("info")));
-                write(context, format!(" {} ", info).into());
+                write(
+                    context,
+                    Span::styled(
+                        format!(" {} ", icons.diagnostic().info()),
+                        context.editor.theme.get("info"),
+                    ),
+                );
+                write(context, Span::raw(format!(" {info} ")));
             }
             Severity::Warning if warnings > 0 => {
                 write(
                     context,
-                    Span::styled("●", context.editor.theme.get("warning")),
+                    Span::styled(
+                        icons.diagnostic().warning().to_string(),
+                        context.editor.theme.get("warning"),
+                    ),
                 );
-                write(context, format!(" {} ", warnings).into());
+                write(context, Span::raw(format!(" {warnings} ")));
             }
             Severity::Error if errors > 0 => {
                 write(
                     context,
-                    Span::styled("●", context.editor.theme.get("error")),
+                    Span::styled(
+                        icons.diagnostic().error().to_string(),
+                        context.editor.theme.get("error"),
+                    ),
                 );
-                write(context, format!(" {} ", errors).into());
+                write(context, Span::raw(format!(" {errors} ")));
             }
             _ => {}
         }
@@ -440,7 +498,17 @@ where
 {
     let file_type = context.doc.language_name().unwrap_or(DEFAULT_LANGUAGE_NAME);
 
-    write(context, format!(" {} ", file_type).into());
+    let icons = ICONS.load();
+
+    if let Some(icon) = icons.mime().get(context.doc.path(), Some(file_type)) {
+        if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+            write(context, Span::styled(format!(" {} ", icon.glyph()), style));
+        } else {
+            write(context, format!(" {} ", icon.glyph()).into());
+        }
+    } else {
+        write(context, format!(" {} ", file_type).into());
+    }
 }
 
 fn render_file_name<'a, F>(context: &mut RenderContext<'a>, write: F)
@@ -537,13 +605,18 @@ fn render_version_control<'a, F>(context: &mut RenderContext<'a>, write: F)
 where
     F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
 {
-    let head = context
-        .doc
-        .version_control_head()
-        .unwrap_or_default()
-        .to_string();
+    let head = context.doc.version_control_head().unwrap_or_default();
 
-    write(context, head.into());
+    let icons = ICONS.load();
+    let icon = icons.vcs().branch();
+
+    let vcs = if icon.is_empty() {
+        format!(" {head} ")
+    } else {
+        format!(" {icon} {head} ")
+    };
+
+    write(context, vcs.into());
 }
 
 fn render_register<'a, F>(context: &mut RenderContext<'a>, write: F)
@@ -583,6 +656,212 @@ where
         .to_string_lossy()
         .to_string();
     write(context, cwd.into())
+}
+
+fn render_function_name<'a, F>(context: &mut RenderContext<'a>, write: F)
+where
+    F: Fn(&mut RenderContext<'a>, Span<'a>) + Copy,
+{
+    let function_name = get_current_function_name_cached(context);
+    if let Some(name) = function_name {
+        let icons = ICONS.load();
+        if let Some(icon) = icons.kind().get("function") {
+            let glyph = icon.glyph();
+            if let Some(style) = icon.color().map(|color| Style::default().fg(color)) {
+                write(context, Span::styled(format!(" {} {}", glyph, name), style));
+            } else {
+                write(context, format!(" {} {} ", glyph, name).into());
+            }
+        } else {
+            write(context, format!(" {} ", name).into());
+        }
+    }
+}
+
+// Simple cache entry for function name lookups.
+#[derive(Clone)]
+struct FuncNameCacheEntry {
+    doc_id: DocumentId,
+    view_id: ViewId,
+    cursor_byte: u32,
+    doc_version: i32,
+    name: Option<String>,
+}
+
+static FUNC_NAME_CACHE: LazyLock<Mutex<Option<FuncNameCacheEntry>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn get_current_function_name_cached(context: &RenderContext) -> Option<String> {
+    let text = context.doc.text().slice(..);
+    let cursor_char = context
+        .doc
+        .selection(context.view.id)
+        .primary()
+        .cursor(text);
+    let cursor_byte = text.char_to_byte(cursor_char) as u32;
+    let doc_id = context.doc.id();
+    let view_id = context.view.id;
+    let doc_version = context.doc.version();
+
+    // Fast path from cache
+    if let Some(entry) = FUNC_NAME_CACHE.lock().unwrap().as_ref() {
+        if entry.doc_id == doc_id
+            && entry.view_id == view_id
+            && entry.cursor_byte == cursor_byte
+            && entry.doc_version == doc_version
+        {
+            return entry.name.clone();
+        }
+    }
+
+    let name = get_current_function_name(context);
+    *FUNC_NAME_CACHE.lock().unwrap() = Some(FuncNameCacheEntry {
+        doc_id,
+        view_id,
+        cursor_byte,
+        doc_version,
+        name: name.clone(),
+    });
+    name
+}
+
+/// Extract a function name from a C/C++ declarator chain.
+///
+/// In C/C++, the function name is not a direct child of `function_definition`
+/// but is nested inside a declarator chain:
+///   function_definition → function_declarator → (qualified_identifier →)* identifier
+fn extract_name_from_declarator(node: TsNode<'_>, text: RopeSlice<'_>) -> Option<String> {
+    let kind = node.kind();
+    match kind {
+        "identifier" | "field_identifier" => {
+            let start_char = text.byte_to_char(node.start_byte() as usize);
+            let end_char = text.byte_to_char(node.end_byte() as usize);
+            Some(text.slice(start_char..end_char).to_string())
+        }
+        "qualified_identifier" => {
+            // Iterate in reverse to get the rightmost (innermost) identifier,
+            // stripping any namespace/class prefix (e.g. "trace::is_valid" → "is_valid").
+            for i in (0..node.child_count()).rev() {
+                if let Some(child) = node.child(i) {
+                    if child.kind() == "identifier" || child.kind() == "field_identifier" {
+                        let start_char = text.byte_to_char(child.start_byte() as usize);
+                        let end_char = text.byte_to_char(child.end_byte() as usize);
+                        return Some(text.slice(start_char..end_char).to_string());
+                    }
+                }
+            }
+            None
+        }
+        k if k.contains("declarator") => {
+            // Handles function_declarator, pointer_declarator, reference_declarator, etc.
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if let Some(name) = extract_name_from_declarator(child, text) {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn get_current_function_name(context: &RenderContext) -> Option<String> {
+    let syntax = context.doc.syntax()?;
+    let text = context.doc.text().slice(..);
+
+    let root = syntax.tree().root_node();
+    let cursor_char = context
+        .doc
+        .selection(context.view.id)
+        .primary()
+        .cursor(text);
+    let byte_pos = text.char_to_byte(cursor_char) as u32;
+
+    // Start from the deepest node at cursor position and walk up
+    let mut node = root.descendant_for_byte_range(byte_pos, byte_pos)?;
+
+    // Walk up the tree to find a function-like node
+    loop {
+        let kind = node.kind();
+
+        // Check if this is a function-like node
+        if kind.contains("function") || kind.contains("method") || kind.contains("closure") {
+            // First, try to find a child node that has the name (for traditional function declarations)
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    // Check if this is the name field (identifier)
+                    if child.kind() == "identifier" || child.kind() == "field_identifier" {
+                        let start_byte = child.start_byte() as usize;
+                        let end_byte = child.end_byte() as usize;
+                        let start_char = text.byte_to_char(start_byte);
+                        let end_char = text.byte_to_char(end_byte);
+                        let name = text.slice(start_char..end_char).to_string();
+                        return Some(name);
+                    }
+                }
+            }
+
+            // C/C++: name is inside a declarator chain
+            // e.g. function_definition → function_declarator → qualified_identifier → identifier
+            for i in 0..node.child_count() {
+                if let Some(child) = node.child(i) {
+                    if child.kind().contains("declarator") {
+                        if let Some(name) = extract_name_from_declarator(child, text) {
+                            return Some(name);
+                        }
+                    }
+                }
+            }
+
+            // For arrow functions or anonymous functions assigned to variables,
+            // check the parent for a variable_declarator, assignment_expression, or pair
+            if let Some(parent) = node.parent() {
+                let parent_kind = parent.kind();
+
+                // Handle: const name = () => {} or let name = function() {}
+                if parent_kind == "variable_declarator" || parent_kind == "assignment_expression" {
+                    for i in 0..parent.child_count() {
+                        if let Some(child) = parent.child(i) {
+                            if child.kind() == "identifier"
+                                && child.byte_range().end <= node.byte_range().start
+                            {
+                                let start_byte = child.start_byte() as usize;
+                                let end_byte = child.end_byte() as usize;
+                                let start_char = text.byte_to_char(start_byte);
+                                let end_char = text.byte_to_char(end_byte);
+                                let name = text.slice(start_char..end_char).to_string();
+                                return Some(name);
+                            }
+                        }
+                    }
+                }
+
+                // Handle: { name: () => {} } or { name() {} }
+                if parent_kind == "pair" || parent_kind == "method_definition" {
+                    for i in 0..parent.child_count() {
+                        if let Some(child) = parent.child(i) {
+                            if child.kind() == "property_identifier"
+                                || (child.kind() == "identifier"
+                                    && child.byte_range().end <= node.byte_range().start)
+                            {
+                                let start_byte = child.start_byte() as usize;
+                                let end_byte = child.end_byte() as usize;
+                                let start_char = text.byte_to_char(start_byte);
+                                let end_char = text.byte_to_char(end_byte);
+                                let name = text.slice(start_char..end_char).to_string();
+                                return Some(name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Move to parent
+        node = node.parent()?;
+    }
 }
 
 fn render_code_action_hint<'a, F>(context: &mut RenderContext<'a>, write: F)

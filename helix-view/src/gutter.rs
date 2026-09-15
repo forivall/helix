@@ -1,10 +1,12 @@
 use std::fmt::Write;
 
 use helix_core::syntax::config::LanguageServerFeature;
+use helix_core::text_folding::Fold;
 
 use crate::{
     editor::GutterType,
     graphics::{Style, UnderlineStyle},
+    icons::ICONS,
     Document, Editor, Theme, View,
 };
 
@@ -48,7 +50,6 @@ impl GutterType {
 }
 
 pub fn diagnostic<'doc>(
-    _editor: &'doc Editor,
     doc: &'doc Document,
     _view: &View,
     theme: &Theme,
@@ -76,15 +77,20 @@ pub fn diagnostic<'doc>(
                                 .any(|ls| ls.id() == id)
                         })
                 });
-            diagnostics_on_line.max_by_key(|d| d.severity).map(|d| {
-                write!(out, "●").ok();
-                match d.severity {
-                    Some(Severity::Error) => error,
-                    Some(Severity::Warning) | None => warning,
-                    Some(Severity::Info) => info,
-                    Some(Severity::Hint) => hint,
-                }
-            })
+
+            diagnostics_on_line
+                .max_by_key(|d| d.severity)
+                .map(move |d| {
+                    let icons = ICONS.load();
+                    let (style, symbol) = match d.severity {
+                        Some(Severity::Error) => (error, icons.diagnostic().error()),
+                        Some(Severity::Warning) | None => (warning, icons.diagnostic().warning()),
+                        Some(Severity::Info) => (info, icons.diagnostic().info()),
+                        Some(Severity::Hint) => (hint, icons.diagnostic().hint()),
+                    };
+                    out.push_str(symbol);
+                    style
+                })
         },
     )
 }
@@ -124,15 +130,17 @@ pub fn diff_style<'doc>(doc: &'doc Document, theme: &Theme) -> GutterFn<'doc> {
                     return None;
                 }
 
+                let icons = ICONS.load();
+
                 let (icon, style) = if hunk.is_pure_insertion() {
-                    ("▍", added)
+                    (icons.gutter().added(), added)
                 } else if hunk.is_pure_removal() {
                     if !first_visual_line {
                         return None;
                     }
-                    ("▔", deleted)
+                    (icons.gutter().deleted(), deleted)
                 } else {
-                    ("▍", modified)
+                    (icons.gutter().modified(), modified)
                 };
 
                 write!(out, "{}", icon).unwrap();
@@ -153,8 +161,9 @@ pub fn line_numbers<'doc>(
 ) -> GutterFn<'doc> {
     let text = doc.text().slice(..);
     let width = line_numbers_width(view, doc);
+    let annotations = view.text_annotations(doc, None);
 
-    let last_line_in_view = view.estimate_last_doc_line(doc);
+    let last_line_in_view = view.estimate_last_doc_line(&annotations, doc);
 
     // Whether to draw the line number for the last line of the
     // document or not.  We only draw it if it's not an empty line.
@@ -168,15 +177,65 @@ pub fn line_numbers<'doc>(
         .char_to_line(doc.selection(view.id).primary().cursor(text));
 
     let line_number = editor.config().line_number;
+    let wrap_indicator = editor
+        .config()
+        .soft_wrap
+        .wrap_indicator
+        .as_ref()
+        .map_or_else(
+            || "↪".into(),
+            |indicator| indicator.clone().chars().take(width).collect::<String>(),
+        );
     let mode = editor.mode;
+
+    // folded lines between `line` and `current_line`
+    let mut folded_lines = None;
+    let folded_lines_of = |fold: Fold| fold.end.line - fold.start.line + 1;
 
     Box::new(
         move |line: usize, selected: bool, first_visual_line: bool, out: &mut String| {
+            let fold_annotations = &annotations.folds;
+
             if line == last_line_in_view && !draw_last {
                 write!(out, "{:>1$}", '~', width).unwrap();
                 Some(linenr)
             } else {
                 use crate::{document::Mode, editor::LineNumber};
+                use std::cmp::Ordering::*;
+                use std::cmp::{max, min};
+
+                // calculate folded lines
+                match current_line.cmp(&line) {
+                    Greater if folded_lines.is_none() => {
+                        fold_annotations.reset_pos(line, |fold| fold.start.line);
+                        let line_range = min(current_line, line)..=max(current_line, line);
+                        folded_lines = Some(fold_annotations.folded_lines_between(&line_range));
+                    }
+                    Greater => match folded_lines {
+                        Some(n) if n > 0 => {
+                            if let Some(fold) =
+                                fold_annotations.consume_next(line, |fold| fold.end.line + 1)
+                            {
+                                folded_lines = Some(n - folded_lines_of(fold))
+                            }
+                        }
+                        _ => (),
+                    },
+                    Equal => {
+                        if folded_lines.is_none() {
+                            fold_annotations.reset_pos(line, |fold| fold.start.line);
+                        }
+                        fold_annotations.consume_next(line, |fold| fold.end.line + 1);
+                        folded_lines = Some(0);
+                    }
+                    Less => {
+                        if let Some(fold) =
+                            fold_annotations.consume_next(line, |fold| fold.end.line + 1)
+                        {
+                            folded_lines = Some(folded_lines.unwrap() + folded_lines_of(fold));
+                        }
+                    }
+                }
 
                 let relative = line_number == LineNumber::Relative
                     && mode != Mode::Insert
@@ -184,7 +243,26 @@ pub fn line_numbers<'doc>(
                     && current_line != line;
 
                 let display_num = if relative {
-                    current_line.abs_diff(line)
+                    match current_line
+                        .abs_diff(line)
+                        .checked_sub(folded_lines.unwrap_or(0))
+                    {
+                        Some(r) => r,
+                        None => {
+                            let msg = format!(
+                                "`folded_lines` can not exceed the abs between `current_line` and `line`\n\
+                                \tcurrent_line = {current_line}; \
+                                \tline = {line}; \
+                                \tfolded_lines = {folded_lines:?}"
+                            );
+                            if cfg!(debug_assertions) {
+                                panic!("{msg}");
+                            } else {
+                                log::error!("{msg}");
+                                current_line.abs_diff(line)
+                            }
+                        }
+                    }
                 } else {
                     line + 1
                 };
@@ -198,10 +276,10 @@ pub fn line_numbers<'doc>(
                 if first_visual_line {
                     write!(out, "{:>1$}", display_num, width).unwrap();
                 } else {
-                    write!(out, "{:>1$}", " ", width).unwrap();
+                    write!(out, "{:>1$}", wrap_indicator, width).unwrap();
                 }
 
-                first_visual_line.then_some(style)
+                Some(style)
             }
         },
     )
@@ -245,9 +323,10 @@ pub fn breakpoints<'doc>(
 
     let breakpoints = doc.path().and_then(|path| editor.breakpoints.get(path));
 
-    let breakpoints = match breakpoints {
-        Some(breakpoints) => breakpoints,
-        None => return Box::new(move |_, _, _, _| None),
+    let breadcrumbs_enabled = editor.config().breadcrumb.enable;
+
+    let Some(breakpoints) = breakpoints else {
+        return Box::new(move |_, _, _, _| None);
     };
 
     Box::new(
@@ -257,7 +336,7 @@ pub fn breakpoints<'doc>(
             }
             let breakpoint = breakpoints
                 .iter()
-                .find(|breakpoint| breakpoint.line == line)?;
+                .find(|breakpoint| breakpoint.line == line + usize::from(breadcrumbs_enabled))?;
 
             let style = if breakpoint.condition.is_some() && breakpoint.log_message.is_some() {
                 error.underline_style(UnderlineStyle::Line)
@@ -269,7 +348,13 @@ pub fn breakpoints<'doc>(
                 breakpoint_style
             };
 
-            let sym = if breakpoint.verified { "●" } else { "◯" };
+            let icons = ICONS.load();
+
+            let sym = if breakpoint.verified {
+                icons.dap().verified()
+            } else {
+                icons.dap().unverified()
+            };
             write!(out, "{}", sym).unwrap();
             Some(style)
         },
@@ -319,7 +404,7 @@ pub fn diagnostics_or_breakpoints<'doc>(
     theme: &Theme,
     is_focused: bool,
 ) -> GutterFn<'doc> {
-    let mut diagnostics = diagnostic(editor, doc, view, theme, is_focused);
+    let mut diagnostics = diagnostic(doc, view, theme, is_focused);
     let mut breakpoints = breakpoints(editor, doc, view, theme, is_focused);
     let mut execution_pause_indicator = execution_pause_indicator(editor, doc, theme, is_focused);
 

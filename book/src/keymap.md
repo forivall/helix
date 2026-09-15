@@ -278,10 +278,10 @@ This layer is similar to Vim keybindings as Kakoune does not support windows.
 | `l`, `Ctrl-l`, `Right` | Move to right split                                  | `jump_view_right` |
 | `q`, `Ctrl-q`          | Close current window                                 | `wclose`          |
 | `o`, `Ctrl-o`          | Only keep the current window, closing all the others | `wonly`           |
-| `H`                    | Swap window to the left                              | `swap_view_left`  |
-| `J`                    | Swap window downwards                                | `swap_view_down`  |
-| `K`                    | Swap window upwards                                  | `swap_view_up`    |
-| `L`                    | Swap window to the right                             | `swap_view_right` |
+| `H`, `Shift-Left`      | Swap window to the left                              | `swap_view_left`  |
+| `J`, `Shift-Down`      | Swap window downwards                                | `swap_view_down`  |
+| `K`, `Shift-Up`        | Swap window upwards                                  | `swap_view_up`    |
+| `L`, `Shift-Right`     | Swap window to the right                             | `swap_view_right` |
 | `ns`, `nCtrl-s`        | New horizontal split with a scratch buffer           | `hsplit_new`      |
 | `nv`, `nCtrl-v`        | New vertical split with a scratch buffer             | `vsplit_new`      |
 
@@ -295,13 +295,14 @@ This layer is a kludge of mappings, mostly pickers.
 | -----   | -----------                                                             | -------                                    |
 | `f`     | Open file picker at LSP workspace root                                  | `file_picker`                              |
 | `F`     | Open file picker at current working directory                           | `file_picker_in_current_directory`         |
-| `e`     | Open file explorer at workspace root                                     | `file_explorer`                            |
-| `.`     | Open file explorer at current buffer's directory                        | `file_explorer_in_current_buffer_directory`|
+| `e`     | Open file explorer at LSP workspace root                                | `file_explorer`                            |
+| `E`     | Open file explorer at the opened file's directory                       | `file_explorer_in_current_buffer_directory`|
 | `b`     | Open buffer picker                                                      | `buffer_picker`                            |
 | `j`     | Open jumplist picker                                                    | `jumplist_picker`                          |
 | `g`     | Open changed file picker                                                | `changed_file_picker`                      |
 | `G`     | Debug (experimental)                                                    | N/A                                        |
 | `k`     | Show documentation for item under cursor in a [popup](#popup) (**LSP**) | `hover`                                    |
+| `K`     | Go to documentation for item under cursor in a new buffer (**LSP**)      | `goto_hover`                                    |
 | `s`     | Open document symbol picker (**LSP** or **TS**)                         | `lsp_or_syntax_symbol_picker`              |
 | `S`     | Open workspace symbol picker (**LSP** or **TS**)                        | `lsp_or_syntax_workspace_symbol_picker`    |
 | `d`     | Open document diagnostics picker (**LSP**)                              | `diagnostics_picker`                       |
@@ -321,6 +322,7 @@ This layer is a kludge of mappings, mostly pickers.
 | `R`     | Replace selections by clipboard contents                                | `replace_selections_with_clipboard`        |
 | `/`     | Global search in workspace folder                                       | `global_search`                            |
 | `?`     | Open command palette                                                    | `command_palette`                          |
+| `B`     | Show blame for the current line                                         | `blame_line`                             |
 
 > 💡 Global search displays results in a fuzzy picker, use `Space + '` to bring it back up after opening a file.
 
@@ -472,8 +474,8 @@ See the documentation page on [pickers](./pickers.md) for more info.
 | -----                        | -------------                                              |
 | `Shift-Tab`, `Up`, `Ctrl-p`  | Previous entry                                             |
 | `Tab`, `Down`, `Ctrl-n`      | Next entry                                                 |
-| `PageUp`, `Ctrl-u`           | Page up                                                    |
-| `PageDown`, `Ctrl-d`         | Page down                                                  |
+| `Ctrl-u`                     | Page up the list                                          |
+| `Ctrl-d`                     | Page down the list                                        |
 | `Home`                       | Go to first entry                                          |
 | `End`                        | Go to last entry                                           |
 | `Enter`                      | Open selected                                              |
@@ -481,7 +483,23 @@ See the documentation page on [pickers](./pickers.md) for more info.
 | `Ctrl-s`                     | Open horizontally                                          |
 | `Ctrl-v`                     | Open vertically                                            |
 | `Ctrl-t`                     | Toggle preview                                             |
+| `PageUp`                     | Scroll the preview up a page (page up the list when no preview is shown)   |
+| `PageDown`                   | Scroll the preview down a page (page down the list when no preview is shown) |
+| `Alt-k`, `Shift-Up`          | Scroll the preview up a line                              |
+| `Alt-j`, `Shift-Down`        | Scroll the preview down a line                            |
 | `Escape`, `Ctrl-c`           | Close picker                                               |
+
+### File Explorer
+
+There are additional keys accessible when using the File Explorer (`Space-e` and `Space-E`).
+
+| Key                          | Description                                                |
+| -----                        | -------------                                              |
+| `Alt-m`                      | Move selected file or directory                            |
+| `Alt-n`                      | Create a new file or directory                             |
+| `Alt-d`                      | Delete the selected file or directory                      |
+| `Alt-c`                      | Copy the selected file                                     |
+| `Alt-y`                      | Yank the path to the selected file or directory            |
 
 ## Prompt
 

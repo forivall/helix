@@ -71,7 +71,8 @@ fn thread_picker(
                     frame.end_line.unwrap_or(frame.line).saturating_sub(1),
                 ));
                 Some((path.into(), pos))
-            });
+            })
+            .with_title("Threads");
             compositor.push(Box::new(picker));
         },
     );
@@ -270,12 +271,8 @@ pub fn dap_launch(cx: &mut Context) {
         |item: &DebugTemplate, _| item.name.as_str().into(),
     )];
 
-    cx.push_layer(Box::new(overlaid(Picker::new(
-        columns,
-        0,
-        templates,
-        (),
-        |cx, template, _action| {
+    cx.push_layer(Box::new(overlaid(
+        Picker::new(columns, 0, templates, (), |cx, template, _action| {
             if template.completion.is_empty() {
                 if let Err(err) = dap_start_impl(cx, Some(&template.name), None, None) {
                     cx.editor.set_error(err.to_string());
@@ -293,8 +290,10 @@ pub fn dap_launch(cx: &mut Context) {
                 });
                 cx.jobs.callback(callback);
             }
-        },
-    ))));
+        })
+        .with_title("Debug Templates"),
+        cx.editor.config().fullscreen_overlay,
+    )));
 }
 
 pub fn dap_restart(cx: &mut Context) {
@@ -789,6 +788,7 @@ pub fn dap_switch_stack_frame(cx: &mut Context) {
                 )
             })
         })
-    });
+    })
+    .with_title("Stack Frames");
     cx.push_layer(Box::new(picker))
 }

@@ -19,12 +19,15 @@ use crate::job::Jobs;
 use crate::ui::picker;
 use helix_view::Editor;
 
+use helix_plugin::PluginManager;
+
 pub use helix_view::input::Event;
 
 pub struct Context<'a> {
     pub editor: &'a mut Editor,
     pub scroll: Option<usize>,
     pub jobs: &'a mut Jobs,
+    pub plugin_manager: Option<std::sync::Arc<PluginManager>>,
 }
 
 impl Context<'_> {
@@ -182,7 +185,14 @@ impl Compositor {
     }
 
     pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
+        // Check if there are prompt layers active and update EditorView
+        let has_prompt = self.has_component("helix_term::ui::prompt::Prompt");
+
         for layer in &mut self.layers {
+            // Update prompt state for EditorView
+            if let Some(editor_view) = layer.as_any_mut().downcast_mut::<crate::ui::EditorView>() {
+                editor_view.prompt_active = has_prompt;
+            }
             layer.render(area, surface, cx);
         }
     }

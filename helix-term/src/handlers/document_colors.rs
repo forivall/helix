@@ -105,9 +105,13 @@ fn attach_document_colors(
     doc_id: DocumentId,
     mut doc_colors: Vec<(usize, lsp::Color)>,
 ) {
-    if !editor.config().lsp.display_color_swatches {
+    let config = editor.config();
+
+    if !config.lsp.display_color_swatches {
         return;
     }
+
+    let color_swatch_string = &config.lsp.color_swatches_string;
 
     let Some(doc) = editor.documents.get_mut(&doc_id) else {
         return;
@@ -126,7 +130,7 @@ fn attach_document_colors(
 
     for (pos, color) in doc_colors {
         color_swatches_padding.push(InlineAnnotation::new(pos, " "));
-        color_swatches.push(InlineAnnotation::new(pos, "■"));
+        color_swatches.push(InlineAnnotation::new(pos, color_swatch_string));
         colors.push(Theme::rgb_highlight(
             (color.red * 255.) as u8,
             (color.green * 255.) as u8,
