@@ -435,6 +435,15 @@ impl Theme {
             .find_map(|s| self.styles.get(s).copied())
     }
 
+    // Get a map of all of the values within a scope. Used for completion highlights
+    pub fn get_scope(&self, prefix: &str) -> HashMap<String, Style> {
+        self.styles
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, v)| {(k[0..prefix.len()].to_string().clone(), v.clone())})
+            .collect()
+    }
+
     /// Get the style of a scope, without falling back to dot separated broader
     /// scopes. For example if `ui.text.focus` is not defined in the theme, it
     /// will return `None`, even if `ui.text` is.

@@ -11,7 +11,6 @@ use helix_core::{self as core, chars, fuzzy::MATCHER, Change, Transaction};
 use helix_lsp::{lsp, util, OffsetEncoding};
 use helix_view::editor::CompletionHighlightType;
 use helix_view::icons::ICONS;
-use helix_view::Theme;
 use helix_view::{
     editor::CompleteAction,
     handlers::lsp::SignatureHelpInvoked,
@@ -30,11 +29,14 @@ use tui::{
 };
 
 use std::cmp::Reverse;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct FormatCompletionData {
-    theme: Theme,
     completion_highlight_type: CompletionHighlightType,
+    fallback_default_style: Style,
+    fallback_directory_style: Style,
+    theme_styles: HashMap<String, Style>,
 }
 
 impl menu::Item for CompletionItem {
@@ -123,11 +125,10 @@ impl menu::Item for CompletionItem {
         let is_folder = kind.0[0].content == "folder";
 
         let highlight_type = format_completion_data.completion_highlight_type;
-        let theme = format_completion_data.theme.clone();
-        let style = theme
-            .try_get(&format!("completion.{}", name))
-            .or_else(|| theme.try_get(name))
-            .unwrap_or_else(|| theme.get("ui.text"));
+        let style = format_completion_data
+            .theme_styles
+            .get(&name as &str)
+            .unwrap_or(&format_completion_data.fallback_default_style);
 
         let mut color: Option<Color> = None;
 
@@ -147,7 +148,7 @@ impl menu::Item for CompletionItem {
         if let Some(color) = color {
             kind.0[0].style = Style::default().fg(color);
         } else if is_folder {
-            kind.0[0].style = theme.get("ui.text.directory");
+            kind.0[0].style = format_completion_data.fallback_default_style;
         }
 
         if let Some(icon) = icons.kind().get(name) {
@@ -159,7 +160,7 @@ impl menu::Item for CompletionItem {
         let label_style = if deprecated {
             Style::default().add_modifier(Modifier::CROSSED_OUT)
         } else if is_folder {
-            theme.get("ui.text.directory")
+            format_completion_data.fallback_directory_style
         } else {
             Style::default()
         };
@@ -188,9 +189,14 @@ impl Completion {
 
         let theme = editor.theme.clone();
         let completion_highlight_type = editor.config().completion_highlight.highlight_type;
+        let fallback_default_style = theme.get("ui.text");
+        let fallback_directory_style = theme.get("ui.text.directory");
+
         let format_completion_data = FormatCompletionData {
-            theme,
             completion_highlight_type,
+            fallback_default_style,
+            fallback_directory_style,
+            theme_styles: theme.get_scope("completion."),
         };
         // Then create the menu
         let menu = Menu::new(
