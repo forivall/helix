@@ -17,6 +17,7 @@ use crate::{
 };
 
 use helix_core::{
+    char_idx_at_visual_offset,
     diagnostic::NumberOrString,
     graphemes::{next_grapheme_boundary, prev_grapheme_boundary},
     movement::Direction,
@@ -36,6 +37,7 @@ use helix_view::{
     icons::ICONS,
     input::{KeyEvent, MouseButton, MouseEvent, MouseEventKind},
     keyboard::{KeyCode, KeyModifiers},
+    view::ViewPosition,
     Document,
     DocumentId,
     Editor,
@@ -400,8 +402,23 @@ impl EditorView {
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
-        if config.breadcrumb.enable {
-            Self::render_breadcrumb(editor, doc, view, area.with_height(1), surface);
+        if view.breadcrumb_offset(doc) == 1 {
+            if view.breadcrumb_bar_empty(doc) {
+                // The bar has no content (`breadcrumb.path` is `none` and the
+                // cursor is outside of all symbols). Its row stays reserved
+                // so the layout never shifts; reveal the text line it covers
+                // instead of drawing an empty bar.
+                Self::render_text_above_view(
+                    editor,
+                    doc,
+                    view,
+                    &text_annotations,
+                    is_focused & self.terminal_focused,
+                    surface,
+                );
+            } else {
+                Self::render_breadcrumb(editor, doc, view, area.with_height(1), surface);
+            }
         }
 
         if !(is_focused && self.terminal_focused) {
@@ -1511,6 +1528,80 @@ impl EditorView {
                 x = draw_element(surface, viewport, x, &name, style);
             }
         }
+    }
+
+    /// Render the visual line directly above the view's scrolled position
+    /// into the row reserved for the breadcrumb bar, used when the bar has
+    /// no content to show. The row stays reserved (so the layout never
+    /// shifts) but the text the bar would otherwise cover stays visible.
+    pub fn render_text_above_view(
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        text_annotations: &TextAnnotations,
+        is_focused: bool,
+        surface: &mut Surface,
+    ) {
+        let theme = &editor.theme;
+        let loader = editor.syn_loader.load();
+        let text = doc.text().slice(..);
+        let view_offset = doc.view_offset(view.id);
+        let inner = view.inner_area(doc);
+        let text_fmt = doc.text_format(inner.width, Some(theme));
+
+        // Find the start of the visual line directly above the first visible
+        // visual line (the same step scrolling up by one line would take).
+        let (anchor, _) = char_idx_at_visual_offset(
+            text,
+            view_offset.anchor,
+            -1,
+            0,
+            &text_fmt,
+            text_annotations,
+        );
+
+        // Nothing to reveal at the start of the document.
+        if anchor == view_offset.anchor {
+            return;
+        }
+
+        let syntax_highlighter =
+            Self::doc_syntax_highlighter(doc, text_annotations, anchor, 1, &loader);
+        let overlays = vec![Self::overlay_syntax_highlights(
+            doc,
+            anchor,
+            1,
+            text_annotations,
+        )];
+
+        // Draw the revealed line's gutter (line numbers, etc.) in the
+        // reserved row, matching the gutters of the lines below.
+        let mut decorations = DecorationManager::default();
+        Self::render_gutter(
+            editor,
+            doc,
+            view,
+            view.area.with_height(1),
+            theme,
+            is_focused,
+            &mut decorations,
+        );
+
+        render_document(
+            surface,
+            Rect::new(inner.x, view.area.y, inner.width, 1),
+            doc,
+            ViewPosition {
+                anchor,
+                horizontal_offset: view_offset.horizontal_offset,
+                vertical_offset: 0,
+            },
+            text_annotations,
+            syntax_highlighter,
+            overlays,
+            theme,
+            decorations,
+        );
     }
 
     pub fn render_gutter<'d>(

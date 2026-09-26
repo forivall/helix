@@ -2,7 +2,7 @@ use crate::{
     align_view,
     annotations::{diagnostics::InlineDiagnostics, plugins::PluginLineAnnotations},
     document::{DocumentColorSwatches, DocumentInlayHints},
-    editor::{GutterConfig, GutterType, ScrolloffConfig},
+    editor::{BreadcrumbPathOptions, GutterConfig, GutterType, ScrolloffConfig},
     graphics::Rect,
     handlers::diagnostics::DiagnosticsHandler,
     Align, Document, DocumentId, Theme, ViewId,
@@ -11,6 +11,7 @@ use crate::{
 use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
+    syntax::config::LanguageServerFeature,
     text_annotations::TextAnnotations,
     text_folding::{FoldAnnotations, RopeSliceFoldExt},
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
@@ -259,8 +260,56 @@ impl View {
     }
 
     /// Height in rows taken by the breadcrumb bar (0 or 1).
+    ///
+    /// The row is always reserved while the bar is enabled and can have
+    /// content, even when the bar is currently empty (see
+    /// [`View::breadcrumb_bar_empty`]), so that hiding and showing the bar's
+    /// content never shifts the layout. With `breadcrumb.path = "none"` a
+    /// document that has no symbols at all can never fill the bar, so no row
+    /// is reserved and the top line is available to the editor.
     pub fn breadcrumb_offset(&self, doc: &Document) -> u16 {
-        u16::from(doc.config.load().breadcrumb.enable)
+        let config = doc.config.load();
+        if !config.breadcrumb.enable {
+            return 0;
+        }
+
+        // The bar always has content when path information is shown.
+        if !matches!(config.breadcrumb.path, BreadcrumbPathOptions::None) {
+            return 1;
+        }
+
+        // With `breadcrumb.path = "none"` the bar only displays symbols. If
+        // the document can never have any symbols, the bar can never have
+        // content, so its row is not reserved at all and the top line is
+        // available to the editor.
+        let no_symbols = match &doc.symbols {
+            // Symbols were computed and there are none.
+            Some(symbols) => symbols.tree.is_empty(),
+            // Symbols were never computed and never will be: the document
+            // has no syntax (e.g. plain text) to derive them from.
+            None => doc.syntax().is_none(),
+        };
+        if no_symbols
+            && doc
+                .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
+                .next()
+                .is_none()
+        {
+            return 0;
+        }
+
+        1
+    }
+
+    /// Whether the breadcrumb bar has no content to display: `breadcrumb.path`
+    /// is `none` and there are no symbols at the cursor. The bar's row stays
+    /// reserved; the renderer reveals the text line it covers instead.
+    pub fn breadcrumb_bar_empty(&self, doc: &Document) -> bool {
+        matches!(doc.config.load().breadcrumb.path, BreadcrumbPathOptions::None)
+            && doc
+                .breadcrumbs
+                .get(&self.id)
+                .is_none_or(|breadcrumb| breadcrumb.is_empty())
     }
 
     //

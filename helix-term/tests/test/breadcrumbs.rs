@@ -1,7 +1,7 @@
 use std::fs;
 
 use helix_term::{application::Application, config::Config};
-use helix_view::{doc, editor::BreadcrumbPathOptions};
+use helix_view::{doc, editor::BreadcrumbPathOptions, view};
 
 use super::*;
 
@@ -73,6 +73,75 @@ async fn breadcrumb_disabled_by_default() -> anyhow::Result<()> {
     };
 
     test_key_sequence(&mut app, Some("j"), Some(&assertion), false).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn breadcrumb_bar_hidden_when_empty_without_path() -> anyhow::Result<()> {
+    let file = tempfile::NamedTempFile::with_suffix(".rs")?;
+    fs::write(
+        file.path(),
+        "\
+fn outer() {
+    fn inner() {
+        let x = 1;
+    }
+}
+// outside of all symbols
+",
+    )?;
+
+    let mut config = Config::default();
+    config.editor.breadcrumb.enable = true;
+    config.editor.breadcrumb.path = BreadcrumbPathOptions::None;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .with_config(config)
+        .build()?;
+
+    // The cursor starts on line 1 (`fn outer() {`), so the bar shows its
+    // trail...
+    let assertion_visible = |app: &Application| {
+        let view = view!(app.editor);
+        let doc = doc!(app.editor);
+        assert!(!view.breadcrumb_bar_empty(doc));
+        assert_eq!(
+            1,
+            view.breadcrumb_offset(doc),
+            "bar row stays reserved while the trail is non-empty"
+        );
+    };
+
+    // ...but moving the cursor to the final comment line leaves it outside
+    // every symbol. The bar then has no content, but its row must stay
+    // reserved (no layout shift) so the covered text line can be revealed.
+    let assertion_hidden = |app: &Application| {
+        let view = view!(app.editor);
+        let doc = doc!(app.editor);
+        let trail = doc.breadcrumbs.get(&view.id);
+        assert!(
+            trail.is_none_or(|breadcrumb| breadcrumb.is_empty()),
+            "trail should be empty outside of all symbols, got {trail:?}"
+        );
+        assert!(view.breadcrumb_bar_empty(doc));
+        assert_eq!(
+            1,
+            view.breadcrumb_offset(doc),
+            "bar row must stay reserved while the trail is empty to avoid layout shift"
+        );
+    };
+
+    test_key_sequences(
+        &mut app,
+        vec![
+            (None, Some(&assertion_visible)),
+            (Some("ge"), Some(&assertion_hidden)),
+        ],
+        false,
+    )
+    .await?;
 
     Ok(())
 }
