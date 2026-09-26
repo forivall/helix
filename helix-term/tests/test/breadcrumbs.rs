@@ -145,3 +145,69 @@ fn outer() {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn breadcrumb_bar_not_reserved_for_document_without_symbols() -> anyhow::Result<()> {
+    // A document that contains no symbols at all can never fill the bar
+    // when `breadcrumb.path = "none"`, so its row is not reserved.
+    let file = tempfile::NamedTempFile::with_suffix(".rs")?;
+    fs::write(file.path(), "// just a comment, no symbols\n")?;
+
+    let mut config = Config::default();
+    config.editor.breadcrumb.enable = true;
+    config.editor.breadcrumb.path = BreadcrumbPathOptions::None;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .with_config(config)
+        .build()?;
+
+    let assertion = |app: &Application| {
+        let view = view!(app.editor);
+        let doc = doc!(app.editor);
+        assert!(
+            view.breadcrumb_bar_empty(doc),
+            "trail should be empty in a document with no symbols"
+        );
+        assert_eq!(
+            0,
+            view.breadcrumb_offset(doc),
+            "no row should be reserved when the document has no symbols"
+        );
+    };
+
+    test_key_sequence(&mut app, Some("j"), Some(&assertion), false).await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn breadcrumb_bar_not_reserved_for_plain_text() -> anyhow::Result<()> {
+    // A plain text file has no syntax to derive symbols from, so no row is
+    // reserved either.
+    let file = tempfile::NamedTempFile::with_suffix(".txt")?;
+    fs::write(file.path(), "hello world\n")?;
+
+    let mut config = Config::default();
+    config.editor.breadcrumb.enable = true;
+    config.editor.breadcrumb.path = BreadcrumbPathOptions::None;
+
+    let mut app = helpers::AppBuilder::new()
+        .with_file(file.path(), None)
+        .with_config(config)
+        .build()?;
+
+    let assertion = |app: &Application| {
+        let view = view!(app.editor);
+        let doc = doc!(app.editor);
+        assert_eq!(
+            0,
+            view.breadcrumb_offset(doc),
+            "no row should be reserved for documents without a syntax"
+        );
+    };
+
+    test_key_sequence(&mut app, Some("j"), Some(&assertion), false).await?;
+
+    Ok(())
+}

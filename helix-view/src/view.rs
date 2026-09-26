@@ -11,7 +11,6 @@ use crate::{
 use helix_core::{
     char_idx_at_visual_offset,
     doc_formatter::TextFormat,
-    syntax::config::LanguageServerFeature,
     text_annotations::TextAnnotations,
     text_folding::{FoldAnnotations, RopeSliceFoldExt},
     visual_offset_from_anchor, visual_offset_from_block, Position, RopeSlice, Selection,
@@ -279,9 +278,10 @@ impl View {
         }
 
         // With `breadcrumb.path = "none"` the bar only displays symbols. If
-        // the document can never have any symbols, the bar can never have
-        // content, so its row is not reserved at all and the top line is
-        // available to the editor.
+        // the document has no symbols to show and none can be computed yet,
+        // the bar can never have content, so its row is not reserved at all
+        // and the top line is available to the editor. Should symbols arrive
+        // later (e.g. from a language server), the row is reserved again.
         let no_symbols = match &doc.symbols {
             // Symbols were computed and there are none.
             Some(symbols) => symbols.tree.is_empty(),
@@ -289,12 +289,7 @@ impl View {
             // has no syntax (e.g. plain text) to derive them from.
             None => doc.syntax().is_none(),
         };
-        if no_symbols
-            && doc
-                .language_servers_with_feature(LanguageServerFeature::DocumentSymbols)
-                .next()
-                .is_none()
-        {
+        if no_symbols {
             return 0;
         }
 
@@ -310,6 +305,43 @@ impl View {
                 .breadcrumbs
                 .get(&self.id)
                 .is_none_or(|breadcrumb| breadcrumb.is_empty())
+    }
+
+    /// The view offset that should be used to render the document.
+    ///
+    /// This is the stored view offset in almost all cases. The exception is
+    /// an empty breadcrumb bar (see [`View::breadcrumb_bar_empty`]): the bar's
+    /// row stays reserved to avoid layout shifts, so the offset is shifted up
+    /// by one visual line to reveal the text the bar would otherwise cover.
+    /// The stored offset is left untouched, so scrolling behavior is
+    /// unaffected and the shift disappears as soon as the bar has content.
+    ///
+    /// The offset is only shifted when the visual line above is a real text
+    /// line: at the start of the document, or when virtual lines sit directly
+    /// above the viewport, the reserved row is left to the bar.
+    pub fn render_offset(&self, doc: &Document) -> ViewPosition {
+        let offset = doc.view_offset(self.id);
+
+        if offset.vertical_offset != 0
+            || self.breadcrumb_offset(doc) == 0
+            || !self.breadcrumb_bar_empty(doc)
+        {
+            return offset;
+        }
+
+        let text = doc.text().slice(..);
+        let text_fmt = doc.text_format(self.inner_width(doc), None);
+        let annotations = self.text_annotations(doc, None);
+
+        // The same step scrolling up by one line would take.
+        let (anchor, _) =
+            char_idx_at_visual_offset(text, offset.anchor, -1, 0, &text_fmt, &annotations);
+
+        if anchor == offset.anchor {
+            return offset;
+        }
+
+        ViewPosition { anchor, ..offset }
     }
 
     //
