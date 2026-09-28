@@ -3457,9 +3457,9 @@ impl Editor {
         let config = self.config();
         let (view, doc) = current_ref!(self);
         if let Some(mut pos) = self.cursor_cache.get(view, doc) {
-            let inner = view.inner_area(doc);
-            pos.col += inner.x as usize;
-            pos.row += inner.y as usize;
+            let text_area = view.text_area(doc);
+            pos.col += text_area.x as usize;
+            pos.row += text_area.y as usize;
             let cursorkind = config.cursor_shape.from_mode(self.mode);
             (Some(pos), cursorkind)
         } else {

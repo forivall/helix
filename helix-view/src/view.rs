@@ -344,7 +344,26 @@ impl View {
         ViewPosition { anchor, ..offset }
     }
 
-    //
+    /// The area occupied by the rendered text.
+    ///
+    /// This is [`View::inner_area`] in almost all cases. The exception is an
+    /// empty breadcrumb bar (see [`View::breadcrumb_bar_empty`]): the bar's
+    /// row stays reserved, but the text viewport is extended one row upward
+    /// over it so the revealed line is rendered (see
+    /// [`View::render_offset`]). Cursor position calculations must use this
+    /// area rather than [`View::inner_area`] so the terminal cursor aligns
+    /// with the rendered text when the viewport is shifted.
+    pub fn text_area(&self, doc: &Document) -> Rect {
+        let inner = self.inner_area(doc);
+        let offset = doc.view_offset(self.id);
+
+        if self.render_offset(doc) != offset {
+            Rect::new(inner.x, self.area.y, inner.width, inner.height + 1)
+        } else {
+            inner
+        }
+    }
+
     pub fn offset_coords_to_in_view(
         &self,
         doc: &Document,
@@ -538,15 +557,15 @@ impl View {
         text: RopeSlice,
         pos: usize,
     ) -> Option<Position> {
-        let view_offset = doc.view_offset(self.id);
+        let render_offset = self.render_offset(doc);
 
-        let viewport = self.inner_area(doc);
+        let viewport = self.text_area(doc);
         let text_fmt = doc.text_format(viewport.width, None);
         let annotations = self.text_annotations(doc, None);
 
         let mut pos = visual_offset_from_anchor(
             text,
-            view_offset.anchor,
+            render_offset.anchor,
             pos,
             &text_fmt,
             &annotations,
@@ -554,14 +573,14 @@ impl View {
         )
         .ok()?
         .0;
-        if pos.row < view_offset.vertical_offset {
+        if pos.row < render_offset.vertical_offset {
             return None;
         }
-        pos.row -= view_offset.vertical_offset;
+        pos.row -= render_offset.vertical_offset;
         if pos.row >= viewport.height as usize {
             return None;
         }
-        pos.col = pos.col.saturating_sub(view_offset.horizontal_offset);
+        pos.col = pos.col.saturating_sub(render_offset.horizontal_offset);
 
         Some(pos)
     }
