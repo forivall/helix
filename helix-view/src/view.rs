@@ -293,6 +293,10 @@ impl View {
             return 0;
         }
 
+        if !doc.expanded_breadcrumbs(self.id) {
+            return 0;
+        }
+
         1
     }
 
@@ -300,11 +304,13 @@ impl View {
     /// is `none` and there are no symbols at the cursor. The bar's row stays
     /// reserved; the renderer reveals the text line it covers instead.
     pub fn breadcrumb_bar_empty(&self, doc: &Document) -> bool {
-        matches!(doc.config.load().breadcrumb.path, BreadcrumbPathOptions::None)
-            && doc
-                .breadcrumbs
-                .get(&self.id)
-                .is_none_or(|breadcrumb| breadcrumb.is_empty())
+        matches!(
+            doc.config.load().breadcrumb.path,
+            BreadcrumbPathOptions::None
+        ) && doc
+            .breadcrumbs
+            .get(&self.id)
+            .is_none_or(|breadcrumb| breadcrumb.is_empty())
     }
 
     /// The view offset that should be used to render the document.
@@ -354,10 +360,17 @@ impl View {
     /// area rather than [`View::inner_area`] so the terminal cursor aligns
     /// with the rendered text when the viewport is shifted.
     pub fn text_area(&self, doc: &Document) -> Rect {
+        let render_offset = self.render_offset(doc);
         let inner = self.inner_area(doc);
         let offset = doc.view_offset(self.id);
+        log::debug!(
+            "render_offset={:?}, inner={:?}, offset={:?}",
+            render_offset,
+            inner,
+            offset
+        );
 
-        if self.render_offset(doc) != offset {
+        if render_offset != offset {
             Rect::new(inner.x, self.area.y, inner.width, inner.height + 1)
         } else {
             inner
@@ -379,8 +392,15 @@ impl View {
     ) -> Option<ViewPosition> {
         let view_offset = doc.get_view_offset(self.id)?;
         let doc_text = doc.text().slice(..);
-        let viewport = self.inner_area(doc);
-        let vertical_viewport_end = view_offset.vertical_offset + viewport.height as usize;
+        // Use the rendered viewport (text_area) and render offset so that
+        // scrolloff calculations match what the user actually sees. When the
+        // breadcrumb bar is empty and the viewport is shifted up to reveal
+        // the line behind it, the rendered viewport is one row taller;
+        // using inner_area here would allow the cursor to scroll one line
+        // past the normal bounds.
+        let viewport = self.text_area(doc);
+        let render_offset = self.render_offset(doc);
+        let vertical_viewport_end = render_offset.vertical_offset + viewport.height as usize;
         let text_fmt = doc.text_format(viewport.width, None);
         let annotations = self.text_annotations(doc, None);
 
@@ -411,7 +431,7 @@ impl View {
         let mut offset = view_offset;
         let off = visual_offset_from_anchor(
             doc_text,
-            offset.anchor,
+            render_offset.anchor,
             cursor,
             &text_fmt,
             &annotations,
@@ -419,7 +439,9 @@ impl View {
         );
 
         let (new_anchor, at_top) = match off {
-            Ok((visual_pos, _)) if visual_pos.row < scrolloff_top + offset.vertical_offset => {
+            Ok((visual_pos, _))
+                if visual_pos.row < scrolloff_top + render_offset.vertical_offset =>
+            {
                 if CENTERING {
                     // cursor out of view
                     return None;

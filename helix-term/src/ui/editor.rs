@@ -404,9 +404,7 @@ impl EditorView {
         let text_annotations = view.text_annotations(doc, Some(theme));
         let mut decorations = DecorationManager::default();
 
-        if view.breadcrumb_offset(doc) == 1 && render_offset == view_offset {
-            // The bar row is reserved and the document is not shifted up to
-            // reveal the line above, so the bar content is drawn.
+        if view.breadcrumb_offset(doc) == 1 && !view.breadcrumb_bar_empty(doc) {
             Self::render_breadcrumb(editor, doc, view, area.with_height(1), surface);
         }
 

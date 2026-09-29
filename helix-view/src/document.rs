@@ -2440,6 +2440,7 @@ impl Document {
 
     pub fn set_view_offset(&mut self, view_id: ViewId, new_offset: ViewPosition) {
         self.view_data_mut(view_id).view_position = new_offset;
+        self.try_unexpand_breadcrumbs(view_id);
     }
 
     pub fn relative_path(&self) -> Option<&Path> {
@@ -2866,6 +2867,19 @@ impl Document {
         }
 
         breadcrumb.truncate_depth(max_depth);
+        if !breadcrumb.is_empty() {
+            self.view_data_mut(view_id).expanded_breadcrumbs = true;
+        }
+    }
+
+    pub fn try_unexpand_breadcrumbs(&mut self, view_id: ViewId) {
+        if self.breadcrumbs.entry(view_id).or_default().is_empty() {
+            self.view_data_mut(view_id).expanded_breadcrumbs = false;
+        }
+    }
+
+    pub fn expanded_breadcrumbs(&self, view_id: ViewId) -> bool {
+        self.view_data(view_id).expanded_breadcrumbs
     }
 
     pub fn set_document_highlights(
@@ -2995,6 +3009,7 @@ impl Document {
 #[derive(Debug, Default)]
 pub struct ViewData {
     view_position: ViewPosition,
+    expanded_breadcrumbs: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -855,6 +855,9 @@ fn move_impl(cx: &mut Context, move_fn: MoveFn, dir: Direction, behaviour: Movem
         )
     });
     drop(annotations);
+    if matches!(dir, Direction::Backward) && doc.selection(view.id).primary().anchor == selection.primary().anchor {
+        doc.try_unexpand_breadcrumbs(view.id);
+    }
     doc.set_selection(view.id, selection);
 }
 
