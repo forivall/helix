@@ -2980,7 +2980,9 @@ impl Editor {
         self.next_document_id =
             DocumentId(unsafe { NonZeroUsize::new_unchecked(self.next_document_id.0.get() + 1) });
         doc.id = id;
-        self.documents.insert(id, doc);
+        // TODO: make configurable
+        // self.documents.insert(id, doc);
+        self.documents.insert_before(self.focused_document_index() + 1, id, doc);
 
         let (save_sender, save_receiver) = tokio::sync::mpsc::unbounded_channel();
         self.saves.insert(id, save_sender);
