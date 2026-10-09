@@ -78,13 +78,13 @@
 
 ((comment) @injection.content
  (#set! injection.language "jsdoc")
- (#match? @injection.content "^/\\*+"))
+ (#match? @injection.content "^/\\*\\*+"))
 
 ; Parse general tags in single line comments
 
 ((comment) @injection.content
  (#set! injection.language "comment")
- (#match? @injection.content "^//"))
+ (#not-match? @injection.content "^/\\*\\*+"))
 
 ; Match string literals passed to standard browser API methods that expects a
 ; css selector as argument.
